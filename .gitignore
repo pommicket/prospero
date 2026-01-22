@@ -2,3 +2,6 @@
 test.vm
 *.bmp
 scratch
+*.out
+*~
+*.swp

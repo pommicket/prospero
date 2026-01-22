@@ -1,5 +1,12 @@
+#![allow(dead_code)]//TODO
 use std::collections::HashMap;
 use std::process::ExitCode;
+
+macro_rules! include_asm {
+	($name:literal) => {
+		include_bytes!(concat!(env!("OUT_DIR"),"/",$name,".out"))
+	}
+}
 
 #[derive(Copy, Clone, Debug)]
 enum Op {
@@ -66,9 +73,23 @@ impl PixelBuffer {
 	unsafe fn offset(self, by: usize) -> Self {
 		Self(unsafe { self.0.add(by) })
 	}
+	unsafe fn ptr(self) -> *mut u8 {
+		self.0
+	}
 }
 unsafe impl Send for PixelBuffer {}
 unsafe impl Sync for PixelBuffer {}
+
+#[derive(Copy, Clone)]
+struct Code(*mut u8);
+unsafe impl Send for Code {}
+unsafe impl Sync for Code {}
+impl Code {
+	unsafe fn run(self, output_data: *mut u8, count: u16, x_strides: &[f32; 16], y_pos: f32, stride16: f32) {
+		let function: unsafe extern "C" fn (*mut u8, u64, *const f32, f32, f32) = unsafe { std::mem::transmute(self.0) };
+		unsafe { function(output_data, count.into(), x_strides.as_ptr(), y_pos, stride16) };
+	}
+}
 
 enum Value {
 	Var(Op),
@@ -214,10 +235,10 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 		index = index.checked_add(1).ok_or("too many lines")?;
 	}
 	const BIT_OFFSET: u32 = 2 + 4 * 3 + 4 + 2 * 4 + 2 * 3;
-	let width: u16 = 512;
-	let height: u16 = 512;
-	if !width.is_multiple_of(8) {
-		return Err(format!("width {width} should be a multiple of 8").into());
+	let width: u16 = 128;
+	let height: u16 = 128;
+	if !width.is_multiple_of(16) {
+		return Err(format!("width {width} should be a multiple of 16").into());
 	}
 	let file_size = BIT_OFFSET + u32::from(width) * u32::from(height) / 8;
 	let fd = unsafe {
@@ -270,16 +291,41 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 	let inv_height2 = 2.0 / f32::from(height);
 	let thread_count = gcd16(height, available_parallelism().unwrap_or(16));
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
-	std::thread::scope(|s| {
-		for t in 0..thread_count {
-			let ops = &ops;
-			s.spawn(move || {
-				let mut buf: Box<Buf> = Box::default();
+	let base_template = include_asm!("base");
+	let start_index = base_template.windows(16).position(|win| win == &[0xcc; 16]).expect("bad ASM");
+	let injection = include_asm!("test");
+	let code = unsafe { libc::mmap(std::ptr::null_mut(), 1<<20, libc::PROT_READ|libc::PROT_WRITE, libc::MAP_ANONYMOUS|libc::MAP_PRIVATE, -1, 0) };
+	if code == libc::MAP_FAILED {
+		return Err("mmap failed".into());
+	}
+	let code: *mut u8 = code.cast();
+	unsafe { code.copy_from_nonoverlapping(base_template.as_ptr(), start_index); }
+	unsafe { code.add(start_index).copy_from_nonoverlapping(injection.as_ptr(), injection.len()); }
+	unsafe { code.add(start_index + injection.len()).copy_from_nonoverlapping(base_template.as_ptr().add(start_index), base_template.len() - start_index); }
+	if unsafe { libc::mprotect(code.cast(), 1<<20, libc::PROT_EXEC) } != 0 {
+		return Err("mprotect failed".into());
+	}
+	let code = Code(code);
+	let mut x_strides = [0.0; 16];
+	for i in 0..16 {
+		x_strides[i] = -1.0 + i as f32 * inv_width2;
+	}
+//	std::thread::scope(|s| {
+let t = 0;
+//		for t in 0..thread_count {
+//			let ops = &ops;
+			let x_strides = &x_strides;
+//			s.spawn(move || {
+//				let mut buf: Box<Buf> = Box::default();
 				let rows_per_thread = height / thread_count;
 				let base_y = rows_per_thread * t;
-				let mut pixel =
-					unsafe { pixels.offset(usize::from(base_y) * usize::from(width) / 8) };
 				for y in base_y..base_y + rows_per_thread {
+					let pixel =
+						unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
+					unsafe {
+						code.run(pixel.ptr(), width / 16, x_strides, y as f32 * inv_height2 - 1.0, 16.0 * inv_width2)
+					};
+					/*
 					for x8 in 0..width / 8 {
 						let mut byte = 0;
 						for bit in 0..8 {
@@ -306,16 +352,17 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 						unsafe {
 							pixel.write(byte);
 						}
-					}
+					}*/
 				}
-			});
-		}
-	});
+//			});
+//		}
+//	});
 	_ = unsafe { libc::munmap(pixels.0.cast(), file_size as usize) };
 	Ok(())
 }
 
 fn main() -> ExitCode {
+	println!("{:?}",include_asm!("base"));
 	if let Err(e) = try_main() {
 		eprintln!("error: {e}");
 		ExitCode::FAILURE
