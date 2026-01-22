@@ -65,15 +65,16 @@ struct Code(*mut u8);
 unsafe impl Send for Code {}
 unsafe impl Sync for Code {}
 impl Code {
+	#[allow(clippy::too_many_arguments)]
 	unsafe fn run(
 		self,
 		output_data: *mut u8,
 		count: u16,
-		x_strides: &ZMMValue,
+		x_strides: &ZmmValue,
 		stride16: f32,
 		y_pos: f32,
-		buffer: &mut [ZMMValue],
-		constants: &[ZMMValue],
+		buffer: &mut [ZmmValue],
+		constants: &[ZmmValue],
 	) {
 		let function: unsafe extern "sysv64" fn(
 			*mut u8,
@@ -81,8 +82,8 @@ impl Code {
 			*const f32,
 			f32,
 			f32,
-			*mut ZMMValue,
-			*const ZMMValue,
+			*mut ZmmValue,
+			*const ZmmValue,
 		) = unsafe { std::mem::transmute(self.0) };
 		let count: u64 = count.into();
 		let x_strides: *const f32 = x_strides.as_ptr();
@@ -152,8 +153,8 @@ unsafe fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
 
 #[derive(Copy, Clone, Default)]
 #[repr(C, align(64))]
-struct ZMMValue([f32; 16]);
-impl ZMMValue {
+struct ZmmValue([f32; 16]);
+impl ZmmValue {
 	fn as_ptr(&self) -> *const f32 {
 		self.0.as_ptr()
 	}
@@ -226,10 +227,10 @@ struct Info {
 	code: Code,
 	pixels: PixelBuffer,
 	rows_per_thread: u16,
-	x_strides: ZMMValue,
+	x_strides: ZmmValue,
 	width: u16,
 	height: u16,
-	constants: Vec<ZMMValue>,
+	constants: Vec<ZmmValue>,
 }
 
 impl Info {
@@ -242,7 +243,7 @@ impl Info {
 		let code = self.code;
 		let x_strides = &self.x_strides;
 		// TODO: pick correct size for buffer
-		let mut buffer = vec![ZMMValue::default(); 10_000];
+		let mut buffer = vec![ZmmValue::default(); 10_000];
 		let constants = &self.constants;
 		for y in base_y..base_y + self.rows_per_thread {
 			let pixel = unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
@@ -342,7 +343,7 @@ fn read_ops(text: String) -> Result<Vec<Op>, Box<dyn Error>> {
 
 #[derive(Clone, Copy, Debug)]
 enum Location {
-	ZMM(u8),
+	Zmm(u8),
 	Buffer(u32),
 	Constant(u32),
 }
@@ -409,7 +410,7 @@ impl LowLevelOp {
 				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x29, 0x81 | mask2]);
 				bytes.write_u32(offset * 64);
 			}
-			Self::Add(dest, src1, Location::ZMM(src2)) => {
+			Self::Add(dest, src1, Location::Zmm(src2)) => {
 				let (d1, d2) = zmm_dest_bits(dest);
 				let (s11, s12) = zmm_src1_bits(src1);
 				let (s21, s22) = zmm_src2_bits(src2);
@@ -433,7 +434,7 @@ impl LowLevelOp {
 			Self::Add(dest, src1, Location::Constant(src2)) => {
 				let (d1, d2) = zmm_dest_bits(dest);
 				let (s11, s12) = zmm_src1_bits(src1);
-				// vaddps zmmA, zmmB, [rcx+offset]
+				// vaddps zmmA, zmmB, [r8+offset]
 				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, 0x58, 0x80 ^ d2]);
 				bytes.write_u32(src2 * 64);
 			}
@@ -447,7 +448,16 @@ fn print_disassembly(code: &[u8]) -> Result<(), Box<dyn Error>> {
 	use std::process::Command;
 	std::fs::write("a.out", code)?;
 	Command::new("objdump")
-		.args(["-w", "-b", "binary", "-Mintel,x86-64", "-m", "i386", "-D", "a.out"])
+		.args([
+			"-w",
+			"-b",
+			"binary",
+			"-Mintel,x86-64",
+			"-m",
+			"i386",
+			"-D",
+			"a.out",
+		])
 		.spawn()?
 		.wait()?;
 	Ok(())
@@ -516,7 +526,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		thread_count >>= 1;
 	}
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
-	let low_level_ops = vec![
+	let low_level_ops = [
 		LowLevelOp::StoreBuffer(123, 1),
 		LowLevelOp::LoadBuffer(12, 123),
 		LowLevelOp::StoreBuffer(456, 2),
@@ -539,7 +549,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		*x_stride = -1.0 + i as f32 * 2.0 / f32::from(width);
 	}
 	let rows_per_thread = height / thread_count;
-	let x_strides = ZMMValue(x_strides);
+	let x_strides = ZmmValue(x_strides);
 	let info = Info {
 		code,
 		pixels,
@@ -547,7 +557,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		x_strides,
 		width,
 		height,
-		constants: vec![ZMMValue::default(); 10_000], //TODO
+		constants: vec![ZmmValue::default(); 10_000], //TODO
 	};
 	if thread_count == 1 {
 		unsafe { info.thread_main(0) };
