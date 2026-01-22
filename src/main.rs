@@ -1,5 +1,5 @@
-use std::process::ExitCode;
 use std::collections::HashMap;
+use std::process::ExitCode;
 
 #[derive(Copy, Clone, Debug)]
 enum Op {
@@ -84,82 +84,42 @@ enum ValueId {
 impl Value {
 	fn add(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
-			(ValueId::Constant(a), ValueId::Constant(b)) => {
-				Value::Constant(a + b)
-			}
-			(ValueId::Var(a), ValueId::Var(b)) => {
-				Value::Var(Op::Add(a, b))
-			}
-			(ValueId::Var(a), ValueId::Constant(b)) => {
-				Value::Var(Op::AddConst(a, b))
-			}
-			(ValueId::Constant(a), ValueId::Var(b)) => {
-				Value::Var(Op::AddConst(b, a))
-			}
+			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a + b),
+			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Add(a, b)),
+			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::AddConst(a, b)),
+			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::AddConst(b, a)),
 		}
 	}
 	fn sub(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
-			(ValueId::Constant(a), ValueId::Constant(b)) => {
-				Value::Constant(a - b)
-			}
-			(ValueId::Var(a), ValueId::Var(b)) => {
-				Value::Var(Op::Sub(a, b))
-			}
-			(ValueId::Var(a), ValueId::Constant(b)) => {
-				Value::Var(Op::AddConst(a, -b))
-			}
-			(ValueId::Constant(a), ValueId::Var(b)) => {
-				Value::Var(Op::SubConst(b, a))
-			}
+			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a - b),
+			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Sub(a, b)),
+			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::AddConst(a, -b)),
+			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::SubConst(b, a)),
 		}
 	}
 	fn mul(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
-			(ValueId::Constant(a), ValueId::Constant(b)) => {
-				Value::Constant(a * b)
-			}
-			(ValueId::Var(a), ValueId::Var(b)) => {
-				Value::Var(Op::Mul(a, b))
-			}
-			(ValueId::Var(a), ValueId::Constant(b)) => {
-				Value::Var(Op::MulConst(a, b))
-			}
-			(ValueId::Constant(a), ValueId::Var(b)) => {
-				Value::Var(Op::MulConst(b, a))
-			}
+			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a * b),
+			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Mul(a, b)),
+			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::MulConst(a, b)),
+			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::MulConst(b, a)),
 		}
 	}
 	fn min(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
-			(ValueId::Constant(a), ValueId::Constant(b)) => {
-				Value::Constant(a.min(b))
-			}
-			(ValueId::Var(a), ValueId::Var(b)) => {
-				Value::Var(Op::Min(a, b))
-			}
-			(ValueId::Var(a), ValueId::Constant(b)) => {
-				Value::Var(Op::MinConst(a, b))
-			}
-			(ValueId::Constant(a), ValueId::Var(b)) => {
-				Value::Var(Op::MinConst(b, a))
-			}
+			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a.min(b)),
+			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Min(a, b)),
+			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::MinConst(a, b)),
+			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::MinConst(b, a)),
 		}
 	}
 	fn max(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
-			(ValueId::Constant(a), ValueId::Constant(b)) => {
-				Value::Constant(a.max(b))
-			}
-			(ValueId::Var(a), ValueId::Var(b)) => {
-				Value::Var(Op::Max(a, b))
-			}
-			(ValueId::Var(a), ValueId::Constant(b)) => {
-				Value::Var(Op::MaxConst(a, b))
-			}
-			(ValueId::Constant(a), ValueId::Var(b)) => {
-				Value::Var(Op::MaxConst(b, a))
-			}
+			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a.max(b)),
+			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Max(a, b)),
+			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::MaxConst(a, b)),
+			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::MaxConst(b, a)),
 		}
 	}
 	fn sqrt(a: ValueId) -> Value {
@@ -192,7 +152,7 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 		let mut words = line.split(' ');
 		let tag = words.next().unwrap();
 		debug_assert!(tag.starts_with('_') && u16::from_str_radix(&tag[1..], 16).unwrap() == index);
-	
+
 		let op = words.next().unwrap();
 		let value = match op {
 			"const" => {
@@ -256,7 +216,7 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 	const BIT_OFFSET: u32 = 2 + 4 * 3 + 4 + 2 * 4 + 2 * 3;
 	let width: u16 = 512;
 	let height: u16 = 512;
-	if width % 8 != 0 {
+	if !width.is_multiple_of(8) {
 		return Err(format!("width {width} should be a multiple of 8").into());
 	}
 	let file_size = BIT_OFFSET + u32::from(width) * u32::from(height) / 8;
@@ -338,7 +298,6 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 									Op::MulConst(x, y) => buf.get(x) * y,
 									Op::MinConst(x, y) => buf.get(x).min(y),
 									Op::MaxConst(x, y) => buf.get(x).max(y),
-									
 								};
 								buf.set(i, val);
 							}
