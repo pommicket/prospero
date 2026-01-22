@@ -619,7 +619,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 			}
 		});
 	}
-	_ = unsafe { libc::munmap(pixels.0.cast(), file_size as usize) };
+	_ = unsafe { libc::munmap(data.cast(), file_size as usize) };
 	Ok(())
 }
 
