@@ -1,6 +1,5 @@
-use std::io::Write;
+use std::process::ExitCode;
 
-#[allow(unused)]//TODO
 #[derive(Copy, Clone, Debug)]
 enum Op {
 	Const(f32),
@@ -35,22 +34,59 @@ impl Default for Buf {
 	}
 }
 
-fn main() {
+fn gcd16(mut x: u16, mut y: u16) -> u16 {
+	while x != 0 {
+		(x, y) = (y % x, x);
+	}
+	y
+}
+
+fn available_parallelism() -> Option<u16> {
+	std::thread::available_parallelism()
+		.ok()?
+		.get()
+		.try_into()
+		.ok()
+}
+
+#[derive(Copy, Clone)]
+struct PixelBuffer(*mut u8);
+impl PixelBuffer {
+	unsafe fn write(&mut self, val: u8) {
+		unsafe {
+			*self.0 = val;
+			self.0 = self.0.add(1);
+		}
+	}
+	#[must_use]
+	unsafe fn offset(self, by: usize) -> Self {
+		Self(unsafe { self.0.add(by) })
+	}
+}
+unsafe impl Send for PixelBuffer {}
+unsafe impl Sync for PixelBuffer {}
+
+fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 	let arg = std::env::args().nth(1);
 	let filename = arg.unwrap_or("prospero.vm".into());
-	let text = std::fs::read_to_string(&filename).expect("couldn't read prospero.vm");
+	let text = std::fs::read_to_string(&filename)
+		.map_err(|e| format!("couldn't read prospero.vm: {e}"))?;
 	let mut ops = vec![];
 	let mut index = 0;
 	for line in text.split('\n') {
 		let line = line.trim_ascii();
-		if line.starts_with('#') { continue; }
-		if line.is_empty() { continue; }
+		if line.starts_with('#') {
+			continue;
+		}
+		if line.is_empty() {
+			continue;
+		}
 		let mut words = line.split(' ');
 		let tag = words.next().unwrap();
 		_ = index;
-		debug_assert!(tag.starts_with('_') && u16::from_str_radix(&tag[1..],16).unwrap()==index);
+		debug_assert!(tag.starts_with('_') && u16::from_str_radix(&tag[1..], 16).unwrap() == index);
 		index += 1;
-		
+
 		let op = words.next().unwrap();
 		ops.push(match op {
 			"const" => {
@@ -101,63 +137,110 @@ fn main() {
 			}
 		});
 	}
-	let mut out_image =
-		std::io::BufWriter::new(std::fs::File::create("out.bmp").unwrap());
-	out_image.write_all(b"BM").unwrap();
-	let bit_offset = 2 + 4 * 3 + 4 + 2 * 4 + 2*3;
-	let width = 256;
-	let height = 256;
-	let file_size = bit_offset + u32::from(width) * u32::from(height) / 8;
-	out_image.write_all(&u32::to_le_bytes(file_size)).unwrap();
-	out_image.write_all(&[0,0,0,0]).unwrap();
-	out_image.write_all(&u32::to_le_bytes(bit_offset)).unwrap();
-	let header_size = 12;
-	out_image.write_all(&u32::to_le_bytes(header_size)).unwrap();
-	out_image.write_all(&u16::to_le_bytes(width)).unwrap();
-	out_image.write_all(&u16::to_le_bytes(height)).unwrap();
-	out_image.write_all(&u16::to_le_bytes(1)).unwrap(); // planes
-	out_image.write_all(&u16::to_le_bytes(1)).unwrap(); // bpp
-	out_image.write_all(&[0, 0, 0, 255, 255, 255]).unwrap(); // colors
-	let mut buf: Box<Buf> = Box::default();
-	let inv_width = 1.0 / f32::from(width);
-	let inv_height = 1.0 / f32::from(height);
-	for y in 0..height {
-		for x8 in 0..width/8 {
-			let mut byte = 0;
-			for bit in 0..8 {
-				for (i, op) in ops.iter().copied().enumerate() {
-					let val = match op {
-						Op::Const(v) => v,
-						Op::Add(x, y) => {
-							buf.get(x) + buf.get(y)
-						}
-						Op::Sub(x, y) => {
-							buf.get(x) - buf.get(y)
-						}
-						Op::Mul(x, y) => {
-							buf.get(x) * buf.get(y)
-						}
-						Op::Min(x, y) => {
-							buf.get(x).min(buf.get(y))
-						}
-						Op::Max(x, y) => {
-							buf.get(x).max(buf.get(y))
-						}
-						Op::VarX => {
-							(x8 * 8 + bit) as f32 * inv_width * 2.0 - 1.0
-						}
-						Op::VarY => {
-							y as f32 * inv_height * 2.0 - 1.0
-						}
-						Op::Neg(x) => -buf.get(x),
-						Op::Sqrt(x) => buf.get(x).sqrt()
-					};
-					buf.set(i, val);
-				}
-				byte |= u8::from(buf.get((ops.len() - 1) as u16) < 0.0) << (7-bit);
-			}
-			out_image.write_all(&[byte]).unwrap();
-		}
+	const BIT_OFFSET: u32 = 2 + 4 * 3 + 4 + 2 * 4 + 2 * 3;
+	let width: u16 = 512;
+	let height: u16 = 512;
+	if width % 8 != 0 {
+		return Err(format!("width {width} should be a multiple of 8").into());
 	}
-	
+	let file_size = BIT_OFFSET + u32::from(width) * u32::from(height) / 8;
+	let fd = unsafe {
+		libc::open(
+			c"out.bmp".as_ptr(),
+			libc::O_RDWR | libc::O_TRUNC | libc::O_CREAT,
+			0o644,
+		)
+	};
+	if fd == -1 {
+		return Err("failed to create file out.bmp".into());
+	}
+	if unsafe { libc::ftruncate(fd, i64::from(file_size)) } != 0 {
+		return Err("failed to truncate file to length".into());
+	}
+
+	let data = unsafe {
+		libc::mmap(
+			std::ptr::null_mut(),
+			file_size as usize,
+			libc::PROT_READ | libc::PROT_WRITE,
+			libc::MAP_SHARED,
+			fd,
+			0,
+		)
+	};
+	if data == libc::MAP_FAILED {
+		return Err("failed to mmap".into());
+	}
+	if unsafe { libc::close(fd) } != 0 {
+		return Err("failed to close file".into());
+	}
+	let mut header = [0_u8; BIT_OFFSET as usize];
+	header[..2].copy_from_slice(b"BM");
+	header[2..6].copy_from_slice(&u32::to_le_bytes(file_size));
+	// 6..10 reserved
+	header[10..14].copy_from_slice(&u32::to_le_bytes(BIT_OFFSET));
+	let header_size = 12;
+	header[14..18].copy_from_slice(&u32::to_le_bytes(header_size));
+	header[18..20].copy_from_slice(&u16::to_le_bytes(width));
+	header[20..22].copy_from_slice(&u16::to_le_bytes(height));
+	header[22..24].copy_from_slice(&u16::to_le_bytes(1)); // planes
+	header[24..26].copy_from_slice(&u16::to_le_bytes(1)); // bpp
+	header[26..BIT_OFFSET as usize].copy_from_slice(&[0, 0, 0, 255, 255, 255]); // colors
+	unsafe {
+		data.copy_from_nonoverlapping(header.as_ptr().cast(), header.len());
+	}
+
+	let inv_width2 = 2.0 / f32::from(width);
+	let inv_height2 = 2.0 / f32::from(height);
+	let thread_count = gcd16(height, available_parallelism().unwrap_or(16));
+	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
+	std::thread::scope(|s| {
+		for t in 0..thread_count {
+			let ops = &ops;
+			s.spawn(move || {
+				let mut buf: Box<Buf> = Box::default();
+				let rows_per_thread = height / thread_count;
+				let base_y = rows_per_thread * t;
+				let mut pixel =
+					unsafe { pixels.offset(usize::from(base_y) * usize::from(width) / 8) };
+				for y in base_y..base_y + rows_per_thread {
+					for x8 in 0..width / 8 {
+						let mut byte = 0;
+						for bit in 0..8 {
+							for (i, op) in ops.iter().copied().enumerate() {
+								let val = match op {
+									Op::Const(v) => v,
+									Op::Add(x, y) => buf.get(x) + buf.get(y),
+									Op::Sub(x, y) => buf.get(x) - buf.get(y),
+									Op::Mul(x, y) => buf.get(x) * buf.get(y),
+									Op::Min(x, y) => buf.get(x).min(buf.get(y)),
+									Op::Max(x, y) => buf.get(x).max(buf.get(y)),
+									Op::VarX => (x8 * 8 + bit) as f32 * inv_width2 - 1.0,
+									Op::VarY => y as f32 * inv_height2 - 1.0,
+									Op::Neg(x) => -buf.get(x),
+									Op::Sqrt(x) => buf.get(x).sqrt(),
+								};
+								buf.set(i, val);
+							}
+							byte |= u8::from(buf.get((ops.len() - 1) as u16) < 0.0) << (7 - bit);
+						}
+						unsafe {
+							pixel.write(byte);
+						}
+					}
+				}
+			});
+		}
+	});
+	_ = unsafe { libc::munmap(pixels.0.cast(), file_size as usize) };
+	Ok(())
+}
+
+fn main() -> ExitCode {
+	if let Err(e) = try_main() {
+		eprintln!("error: {e}");
+		ExitCode::FAILURE
+	} else {
+		ExitCode::SUCCESS
+	}
 }
