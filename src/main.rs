@@ -145,6 +145,15 @@ unsafe fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
 	let [j0, j1, j2, j3] = jump_offset.to_le_bytes();
 	let epilogue = [0x0f, 0x8f, j0, j1, j2, j3, 0xc3];
 	unsafe { ptr.copy_from_nonoverlapping(epilogue.as_ptr(), epilogue.len()) };
+	let code_size = unsafe { ptr.offset_from(code) } as usize;
+	for i in 0..code_size / 64 {
+		unsafe {
+			std::arch::asm!(
+				"clflushopt [{x}]",
+				x = in(reg) code.add(i * 64)
+			)
+		}
+	}
 	if unsafe { libc::mprotect(code.cast(), map_size, libc::PROT_EXEC) } != 0 {
 		return Err("mprotect failed".into());
 	}
