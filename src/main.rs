@@ -1,14 +1,16 @@
-#![allow(dead_code)]//TODO
 use std::collections::HashMap;
-use std::process::ExitCode;
 use std::error::Error;
+use std::process::ExitCode;
+
+const SINGLE_THREADED: bool = true;
 
 macro_rules! include_asm {
 	($name:literal) => {
-		include_bytes!(concat!(env!("OUT_DIR"),"/",$name,".out"))
-	}
+		include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".out"))
+	};
 }
 
+#[allow(dead_code)] // TODO
 #[derive(Copy, Clone, Debug)]
 enum Op {
 	VarX,
@@ -31,45 +33,21 @@ fn parse_var(var: &str) -> u16 {
 	u16::from_str_radix(&var[1..], 16).unwrap()
 }
 
-struct Buf([f32; 65536]);
-impl Buf {
-	fn get(&self, i: u16) -> f32 {
-		self.0[usize::from(i)]
-	}
-	fn set(&mut self, i: usize, value: f32) {
-		self.0[i] = value;
-	}
-}
-impl Default for Buf {
-	fn default() -> Self {
-		Self([0.0; 65536])
-	}
-}
-
-fn gcd16(mut x: u16, mut y: u16) -> u16 {
-	while x != 0 {
-		(x, y) = (y % x, x);
-	}
-	y
-}
-
 fn available_parallelism() -> Option<u16> {
-	std::thread::available_parallelism()
+	if SINGLE_THREADED {
+		return Some(1);
+	}
+	let result: u16 = std::thread::available_parallelism()
 		.ok()?
 		.get()
 		.try_into()
-		.ok()
+		.ok()?;
+	Some(result.min(16384))
 }
 
 #[derive(Copy, Clone)]
 struct PixelBuffer(*mut u8);
 impl PixelBuffer {
-	unsafe fn write(&mut self, val: u8) {
-		unsafe {
-			*self.0 = val;
-			self.0 = self.0.add(1);
-		}
-	}
 	#[must_use]
 	unsafe fn offset(self, by: usize) -> Self {
 		Self(unsafe { self.0.add(by) })
@@ -86,8 +64,16 @@ struct Code(*mut u8);
 unsafe impl Send for Code {}
 unsafe impl Sync for Code {}
 impl Code {
-	unsafe fn run(self, output_data: *mut u8, count: u16, x_strides: &AVX512, stride16: f32, y_pos: f32) {
-		let function: unsafe extern "C" fn (*mut u8, u64, *const f32, f32, f32) = unsafe { std::mem::transmute(self.0) };
+	unsafe fn run(
+		self,
+		output_data: *mut u8,
+		count: u16,
+		x_strides: &AVX512,
+		stride16: f32,
+		y_pos: f32,
+	) {
+		let function: unsafe extern "C" fn(*mut u8, u64, *const f32, f32, f32) =
+			unsafe { std::mem::transmute(self.0) };
 		let count: u64 = count.into();
 		let x_strides: *const f32 = x_strides.as_ptr();
 		unsafe { function(output_data, count, x_strides, stride16, y_pos) };
@@ -96,25 +82,47 @@ impl Code {
 
 unsafe fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
 	let base_template = include_asm!("base");
-	let marker_idx = base_template.windows(16).position(|win| win == &[0xcc; 16]).expect("bad ASM");
+	let marker_idx = base_template
+		.windows(16)
+		.position(|win| win == [0xcc; 16])
+		.expect("bad ASM");
 	let base_template_prefix = &base_template[..marker_idx];
 	let base_template_suffix = &base_template[marker_idx + 16..];
-	let code = unsafe { libc::mmap(std::ptr::null_mut(), 1<<20, libc::PROT_READ|libc::PROT_WRITE, libc::MAP_ANONYMOUS|libc::MAP_PRIVATE, -1, 0) };
+	let map_size = (base_template.len() + core.len() + 128).next_multiple_of(4096);
+	if map_size > (1 << 30) {
+		return Err("map too large. i'm scared.".into());
+	}
+	let code = unsafe {
+		libc::mmap(
+			std::ptr::null_mut(),
+			map_size,
+			libc::PROT_READ | libc::PROT_WRITE,
+			libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+			-1,
+			0,
+		)
+	};
 	if code == libc::MAP_FAILED {
 		return Err("mmap failed".into());
 	}
 	let code: *mut u8 = code.cast();
-	unsafe { code.copy_from_nonoverlapping(base_template_prefix.as_ptr(), base_template_prefix.len()); }
+	unsafe {
+		code.copy_from_nonoverlapping(base_template_prefix.as_ptr(), base_template_prefix.len());
+	}
 	let ptr = unsafe { code.add(base_template_prefix.len()) };
-	unsafe { ptr.copy_from_nonoverlapping(core.as_ptr(), core.len()); }
+	unsafe {
+		ptr.copy_from_nonoverlapping(core.as_ptr(), core.len());
+	}
 	let ptr = unsafe { ptr.add(core.len()) };
-	unsafe { ptr.copy_from_nonoverlapping(base_template_suffix.as_ptr(), base_template_suffix.len()); }
+	unsafe {
+		ptr.copy_from_nonoverlapping(base_template_suffix.as_ptr(), base_template_suffix.len());
+	}
 	let ptr = unsafe { ptr.add(base_template_suffix.len()) };
 	let jump_offset = -((core.len() + base_template_suffix.len() + 6) as i32);
 	let [j0, j1, j2, j3] = jump_offset.to_le_bytes();
 	let epilogue = [0x0f, 0x8f, j0, j1, j2, j3, 0xc3];
 	unsafe { ptr.copy_from_nonoverlapping(epilogue.as_ptr(), epilogue.len()) };
-	if unsafe { libc::mprotect(code.cast(), 1<<20, libc::PROT_EXEC) } != 0 {
+	if unsafe { libc::mprotect(code.cast(), map_size, libc::PROT_EXEC) } != 0 {
 		return Err("mprotect failed".into());
 	}
 	Ok(Code(code))
@@ -198,7 +206,7 @@ struct Info {
 	rows_per_thread: u16,
 	x_strides: AVX512,
 	width: u16,
-	height: u16
+	height: u16,
 }
 
 impl Info {
@@ -211,10 +219,15 @@ impl Info {
 		let code = self.code;
 		let x_strides = &self.x_strides;
 		for y in base_y..base_y + self.rows_per_thread {
-			let pixel =
-				unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
+			let pixel = unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
 			unsafe {
-				code.run(pixel.ptr(), width / 16, x_strides, 16.0 * inv_width2, y as f32 * inv_height2 - 1.0)
+				code.run(
+					pixel.ptr(),
+					width / 16,
+					x_strides,
+					16.0 * inv_width2,
+					y as f32 * inv_height2 - 1.0,
+				)
 			};
 		}
 	}
@@ -301,8 +314,8 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		index = index.checked_add(1).ok_or("too many lines")?;
 	}
 	const BIT_OFFSET: u32 = 2 + 4 * 3 + 4 + 2 * 4 + 2 * 3;
-	let width: u16 = 128;
-	let height: u16 = 128;
+	let width: u16 = 4096;
+	let height: u16 = 4096;
 	if !width.is_multiple_of(16) {
 		return Err(format!("width {width} should be a multiple of 16").into());
 	}
@@ -352,13 +365,15 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	unsafe {
 		data.copy_from_nonoverlapping(header.as_ptr().cast(), header.len());
 	}
-
-	let thread_count = 1;//gcd16(height, available_parallelism().unwrap_or(16));
+	let mut thread_count = available_parallelism().unwrap_or(16).next_power_of_two();
+	while !height.is_multiple_of(thread_count) {
+		thread_count >>= 1;
+	}
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
 	let code = unsafe { wrap_code(include_asm!("test")) }?;
 	let mut x_strides = [0.0; 16];
-	for i in 0..16 {
-		x_strides[i] = -1.0 + i as f32 * 2.0 / f32::from(width);
+	for (i, x_stride) in x_strides.iter_mut().enumerate() {
+		*x_stride = -1.0 + i as f32 * 2.0 / f32::from(width);
 	}
 	let rows_per_thread = height / thread_count;
 	let x_strides = AVX512(x_strides);
@@ -370,50 +385,25 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		width,
 		height,
 	};
-//	std::thread::scope(|s| {
-//		for t in 0..thread_count {
-//			let ops = &ops;
-	unsafe { info.thread_main(0) };
-//			s.spawn(move || {
-//				let mut buf: Box<Buf> = Box::default();
-					/*
-					for x8 in 0..width / 8 {
-						let mut byte = 0;
-						for bit in 0..8 {
-							for (i, op) in ops.iter().copied().enumerate() {
-								let val = match op {
-									Op::Add(x, y) => buf.get(x) + buf.get(y),
-									Op::Sub(x, y) => buf.get(x) - buf.get(y),
-									Op::Mul(x, y) => buf.get(x) * buf.get(y),
-									Op::Min(x, y) => buf.get(x).min(buf.get(y)),
-									Op::Max(x, y) => buf.get(x).max(buf.get(y)),
-									Op::VarX => (x8 * 8 + bit) as f32 * inv_width2 - 1.0,
-									Op::VarY => y as f32 * inv_height2 - 1.0,
-									Op::Sqrt(x) => buf.get(x).sqrt(),
-									Op::AddConst(x, y) => buf.get(x) + y,
-									Op::SubConst(x, y) => y - buf.get(x),
-									Op::MulConst(x, y) => buf.get(x) * y,
-									Op::MinConst(x, y) => buf.get(x).min(y),
-									Op::MaxConst(x, y) => buf.get(x).max(y),
-								};
-								buf.set(i, val);
-							}
-							byte |= u8::from(buf.get((ops.len() - 1) as u16) < 0.0) << (7 - bit);
-						}
-						unsafe {
-							pixel.write(byte);
-						}
-					}*/
-//				}
-//			});
-//		}
-//	});
+	if thread_count == 1 {
+		unsafe { info.thread_main(0) };
+	} else {
+		std::thread::scope(|s| {
+			let mut threads = vec![];
+			for t in 0..thread_count {
+				let info = &info;
+				threads.push(s.spawn(move || unsafe { info.thread_main(t) }));
+			}
+			for thread in threads {
+				thread.join().unwrap();
+			}
+		});
+	}
 	_ = unsafe { libc::munmap(pixels.0.cast(), file_size as usize) };
 	Ok(())
 }
 
 fn main() -> ExitCode {
-	println!("{:?}",include_asm!("base"));
 	if let Err(e) = try_main() {
 		eprintln!("error: {e}");
 		ExitCode::FAILURE
