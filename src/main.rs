@@ -365,20 +365,26 @@ impl Info {
 			if interpreted {
 				let mut zmm = [ZmmValue::default(); 32];
 				let mut ptr = pixel.ptr();
-				for x_idx in 0..self.width {
-					let x = x_idx as f32 * inv_width2 - 1.0;
-					zmm[ZMM_X as usize] = ZmmValue::constant(x);
+				for x_idx in 0..self.width / 16 {
+					let x = x_idx as f32 * 16.0 * inv_width2;
+					zmm[ZMM_X as usize] = ZmmValue::constant(x) + *x_strides;
 					zmm[ZMM_Y as usize] = ZmmValue::constant(y);
 					for instruction in self.instructions.iter().copied() {
 						self.interpret(instruction, &mut zmm, &mut buffer);
 					}
 					let output = zmm[ZMM_OUTPUT as usize];
-					if output.0[0] < 0.0 {
-						unsafe { *ptr |= 1 << (7 - x_idx % 8) };
+					for i in 0..8 {
+						if output.0[i] < 0.0 {
+							unsafe { *ptr |= 1 << (7-i); }
+						}
 					}
-					if x_idx % 8 == 7 {
-						ptr = unsafe { ptr.add(1) };
+					ptr = unsafe { ptr.add(1) };
+					for i in 8..16 {
+						if output.0[i] < 0.0 {
+							unsafe { *ptr |= 1 << (15-i); }
+						}
 					}
+					ptr = unsafe { ptr.add(1) };
 				}
 			} else {
 				unsafe {
