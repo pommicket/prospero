@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::process::ExitCode;
+use std::io::Write;
 
 #[cfg(not(target_arch = "x86_64"))]
 fn _check_target() {
@@ -349,7 +350,7 @@ impl Info {
 		}
 	}
 	unsafe fn thread_main(&self, thread_idx: u16) {
-		let interpreted = true; // for testing purposes
+		let interpreted = false; // for testing purposes
 		let base_y = self.rows_per_thread * thread_idx;
 		let inv_width2 = 2.0 / f32::from(self.width);
 		let inv_height2 = 2.0 / f32::from(self.height);
@@ -640,11 +641,10 @@ impl Instruction {
 	}
 }
 
-#[allow(dead_code)]
 fn print_disassembly(code: &[u8]) -> Result<(), Box<dyn Error>> {
 	use std::process::Command;
 	std::fs::write("a.out", code)?;
-	Command::new("objdump")
+	let output = Command::new("objdump")
 		.args([
 			"-w",
 			"-b",
@@ -655,8 +655,20 @@ fn print_disassembly(code: &[u8]) -> Result<(), Box<dyn Error>> {
 			"-D",
 			"a.out",
 		])
-		.spawn()?
-		.wait()?;
+		.output()?;
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	std::fs::write("disassembly.out", stdout.as_bytes())?;
+	//println!("{stdout}");
+	
+	Ok(())
+}
+fn print_instructions(instructions: &[Instruction]) -> Result<(), Box<dyn Error>> {
+	let out = std::fs::File::create("instructions.out")
+		.map_err(|e| format!("error creating instructions.out: {e}"))?;
+	let mut out = std::io::BufWriter::new(out);
+	for instruction in instructions {
+		writeln!(out, "{instruction:?}")?;
+	}
 	Ok(())
 }
 
@@ -745,7 +757,7 @@ impl Compiler {
 
 fn compile_down(ops: Vec<Op>) -> CompilationResult {
 	let mut constants = ConstantList::default();
-	constants.add(-1.0);
+	constants.add(f32::from_bits(0x8000_0000));
 	let mut compiler = Compiler {
 		instructions: vec![],
 		locations: vec![],
@@ -880,8 +892,8 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		.map_err(|e| format!("couldn't read prospero.vm: {e}"))?;
 	let ops = read_ops(text)?;
 	const BIT_OFFSET: u32 = 2 + 4 * 3 + 4 + 2 * 4 + 2 * 3;
-	let width: u16 = 256;
-	let height: u16 = 256;
+	let width: u16 = 1024;
+	let height: u16 = 1024;
 	if !width.is_multiple_of(16) {
 		return Err(format!("width {width} should be a multiple of 16").into());
 	}
@@ -941,6 +953,9 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		constants,
 		buffer_entries_needed,
 	} = compile_down(ops);
+	if cfg!(debug_assertions) {
+		print_instructions(&instructions)?;
+	}
 	let mut core = vec![0u8; instructions.len() * 16];
 	let mut rest = &mut core[..];
 	for op in instructions.iter().copied() {

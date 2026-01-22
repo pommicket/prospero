@@ -46,9 +46,6 @@ vmovaps zmm2, [rdx]
 ; extract sign bit from each float in zmm3. kind of a miracle that this exists!
 	vpmovd2m k1, zmm3
 	kmovw eax, k1
-; sign bit set -> negative -> should be black (0)
-; sign bit unset -> positive -> should be white (1)
-	not eax
 ; reverse groups of 4 bits in each byte
 	ror al, 4
 	ror ah, 4
