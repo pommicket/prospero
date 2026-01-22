@@ -1,6 +1,7 @@
 #![allow(dead_code)]//TODO
 use std::collections::HashMap;
 use std::process::ExitCode;
+use std::error::Error;
 
 macro_rules! include_asm {
 	($name:literal) => {
@@ -93,6 +94,32 @@ impl Code {
 	}
 }
 
+unsafe fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
+	let base_template = include_asm!("base");
+	let marker_idx = base_template.windows(16).position(|win| win == &[0xcc; 16]).expect("bad ASM");
+	let base_template_prefix = &base_template[..marker_idx];
+	let base_template_suffix = &base_template[marker_idx + 16..];
+	let code = unsafe { libc::mmap(std::ptr::null_mut(), 1<<20, libc::PROT_READ|libc::PROT_WRITE, libc::MAP_ANONYMOUS|libc::MAP_PRIVATE, -1, 0) };
+	if code == libc::MAP_FAILED {
+		return Err("mmap failed".into());
+	}
+	let code: *mut u8 = code.cast();
+	unsafe { code.copy_from_nonoverlapping(base_template_prefix.as_ptr(), base_template_prefix.len()); }
+	let ptr = unsafe { code.add(base_template_prefix.len()) };
+	unsafe { ptr.copy_from_nonoverlapping(core.as_ptr(), core.len()); }
+	let ptr = unsafe { ptr.add(core.len()) };
+	unsafe { ptr.copy_from_nonoverlapping(base_template_suffix.as_ptr(), base_template_suffix.len()); }
+	let ptr = unsafe { ptr.add(base_template_suffix.len()) };
+	let jump_offset = -((core.len() + base_template_suffix.len() + 6) as i32);
+	let [j0, j1, j2, j3] = jump_offset.to_le_bytes();
+	let epilogue = [0x0f, 0x8f, j0, j1, j2, j3, 0xc3];
+	unsafe { ptr.copy_from_nonoverlapping(epilogue.as_ptr(), epilogue.len()) };
+	if unsafe { libc::mprotect(code.cast(), 1<<20, libc::PROT_EXEC) } != 0 {
+		return Err("mprotect failed".into());
+	}
+	Ok(Code(code))
+}
+
 #[derive(Copy, Clone)]
 #[repr(C, align(64))]
 struct AVX512([f32; 16]);
@@ -165,7 +192,7 @@ impl Value {
 	}
 }
 
-fn try_main() -> Result<(), Box<dyn std::error::Error>> {
+fn try_main() -> Result<(), Box<dyn Error>> {
 	let arg = std::env::args().nth(1);
 	let filename = arg.unwrap_or("prospero.vm".into());
 	let text = std::fs::read_to_string(&filename)
@@ -302,30 +329,7 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 	let inv_height2 = 2.0 / f32::from(height);
 	let thread_count = 1;//gcd16(height, available_parallelism().unwrap_or(16));
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
-	let base_template = include_asm!("base");
-	let marker_idx = base_template.windows(16).position(|win| win == &[0xcc; 16]).expect("bad ASM");
-	let base_template_prefix = &base_template[..marker_idx];
-	let base_template_suffix = &base_template[marker_idx + 16..];
-	let injection = include_asm!("test");
-	let code = unsafe { libc::mmap(std::ptr::null_mut(), 1<<20, libc::PROT_READ|libc::PROT_WRITE, libc::MAP_ANONYMOUS|libc::MAP_PRIVATE, -1, 0) };
-	if code == libc::MAP_FAILED {
-		return Err("mmap failed".into());
-	}
-	let code: *mut u8 = code.cast();
-	unsafe { code.copy_from_nonoverlapping(base_template_prefix.as_ptr(), base_template_prefix.len()); }
-	let ptr = unsafe { code.add(base_template_prefix.len()) };
-	unsafe { ptr.copy_from_nonoverlapping(injection.as_ptr(), injection.len()); }
-	let ptr = unsafe { ptr.add(injection.len()) };
-	unsafe { ptr.copy_from_nonoverlapping(base_template_suffix.as_ptr(), base_template_suffix.len()); }
-	let ptr = unsafe { ptr.add(base_template_suffix.len()) };
-	let jump_offset = -((injection.len() + base_template_suffix.len() + 6) as i32);
-	let [j0, j1, j2, j3] = jump_offset.to_le_bytes();
-	let epilogue = [0x0f, 0x8f, j0, j1, j2, j3, 0xc3];
-	unsafe { ptr.copy_from_nonoverlapping(epilogue.as_ptr(), epilogue.len()) };
-	if unsafe { libc::mprotect(code.cast(), 1<<20, libc::PROT_EXEC) } != 0 {
-		return Err("mprotect failed".into());
-	}
-	let code = Code(code);
+	let code = unsafe { wrap_code(include_asm!("test")) }?;
 	let mut x_strides = [0.0; 16];
 	for i in 0..16 {
 		x_strides[i] = -1.0 + i as f32 * inv_width2;
