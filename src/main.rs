@@ -1,4 +1,4 @@
-#![allow(dead_code)]//TODO
+#![allow(dead_code)] //TODO
 use std::collections::HashMap;
 use std::error::Error;
 use std::process::ExitCode;
@@ -75,13 +75,30 @@ impl Code {
 		buffer: &mut [ZMMValue],
 		constants: &[ZMMValue],
 	) {
-		let function: unsafe extern "sysv64" fn(*mut u8, u64, *const f32, f32, f32, *mut ZMMValue, *const ZMMValue) =
-			unsafe { std::mem::transmute(self.0) };
+		let function: unsafe extern "sysv64" fn(
+			*mut u8,
+			u64,
+			*const f32,
+			f32,
+			f32,
+			*mut ZMMValue,
+			*const ZMMValue,
+		) = unsafe { std::mem::transmute(self.0) };
 		let count: u64 = count.into();
 		let x_strides: *const f32 = x_strides.as_ptr();
 		let buffer = buffer.as_mut_ptr();
 		let constants = constants.as_ptr();
-		unsafe { function(output_data, count, x_strides, stride16, y_pos, buffer, constants) };
+		unsafe {
+			function(
+				output_data,
+				count,
+				x_strides,
+				stride16,
+				y_pos,
+				buffer,
+				constants,
+			)
+		};
 	}
 }
 
@@ -371,7 +388,9 @@ trait ByteWriter {
 
 impl ByteWriter for &mut [u8] {
 	fn write(&mut self, bytes: &[u8]) {
-		self.split_off_mut(..bytes.len()).unwrap().copy_from_slice(bytes);
+		self.split_off_mut(..bytes.len())
+			.unwrap()
+			.copy_from_slice(bytes);
 	}
 }
 
@@ -381,17 +400,13 @@ impl LowLevelOp {
 			Self::LoadBuffer(r, offset) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
 				// vmovaps zmmA, [rcx+offset]
-				bytes.write(
-					&[0x62,0xf1 ^ mask1,0x7c,0x48,0x28,0x81 | mask2]
-				);
+				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x28, 0x81 | mask2]);
 				bytes.write_u32(offset * 64);
 			}
 			Self::StoreBuffer(offset, r) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
 				// vmovaps [rcx+offset], zmmA
-				bytes.write(
-					&[0x62,0xf1 ^ mask1,0x7c,0x48,0x29,0x81 | mask2]
-				);
+				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x29, 0x81 | mask2]);
 				bytes.write_u32(offset * 64);
 			}
 			Self::Add(dest, src1, Location::ZMM(src2)) => {
@@ -399,11 +414,43 @@ impl LowLevelOp {
 				let (s11, s12) = zmm_src1_bits(src1);
 				let (s21, s22) = zmm_src2_bits(src2);
 				// vaddps zmmA, zmmB, zmmC
-				bytes.write(&[0x62, 0xf1 ^ d1 ^ s21, 0x7c ^ s11, 0x48 ^ s12, 0x58, 0xc0 ^ s22 ^ d2]);
+				bytes.write(&[
+					0x62,
+					0xf1 ^ d1 ^ s21,
+					0x7c ^ s11,
+					0x48 ^ s12,
+					0x58,
+					0xc0 ^ s22 ^ d2,
+				]);
 			}
-			_ => todo!()
+			Self::Add(dest, src1, Location::Buffer(src2)) => {
+				let (d1, d2) = zmm_dest_bits(dest);
+				let (s11, s12) = zmm_src1_bits(src1);
+				// vaddps zmmA, zmmB, [rcx+offset]
+				bytes.write(&[0x62, 0xf1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, 0x58, 0x81 ^ d2]);
+				bytes.write_u32(src2 * 64);
+			}
+			Self::Add(dest, src1, Location::Constant(src2)) => {
+				let (d1, d2) = zmm_dest_bits(dest);
+				let (s11, s12) = zmm_src1_bits(src1);
+				// vaddps zmmA, zmmB, [rcx+offset]
+				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, 0x58, 0x80 ^ d2]);
+				bytes.write_u32(src2 * 64);
+			}
+			_ => todo!(),
 		}
 	}
+}
+
+#[allow(dead_code)]
+fn print_disassembly(code: &[u8]) -> Result<(), Box<dyn Error>> {
+	use std::process::Command;
+	std::fs::write("a.out", code)?;
+	Command::new("objdump")
+		.args(["-w", "-b", "binary", "-Mintel,x86-64", "-m", "i386", "-D", "a.out"])
+		.spawn()?
+		.wait()?;
+	Ok(())
 }
 
 fn try_main() -> Result<(), Box<dyn Error>> {
@@ -473,8 +520,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		LowLevelOp::StoreBuffer(123, 1),
 		LowLevelOp::LoadBuffer(12, 123),
 		LowLevelOp::StoreBuffer(456, 2),
-		LowLevelOp::LoadBuffer(13, 456),
-		LowLevelOp::Add(3, 12, Location::ZMM(13)),
+		LowLevelOp::Add(3, 12, Location::Constant(456)),
 	];
 	let mut core = vec![0u8; low_level_ops.len() * 16];
 	let mut rest = &mut core[..];
@@ -483,6 +529,9 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	}
 	let rest_len = rest.len();
 	core.truncate(core.len() - rest_len);
+	if cfg!(debug_assertions) {
+		print_disassembly(&core)?;
+	}
 	let code = unsafe { wrap_code(&core) }?;
 	//let code = unsafe { wrap_code(include_asm!("test")) }?;
 	let mut x_strides = [0.0; 16];
@@ -498,7 +547,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		x_strides,
 		width,
 		height,
-		constants: vec![ZMMValue::default(); 8],//TODO
+		constants: vec![ZMMValue::default(); 10_000], //TODO
 	};
 	if thread_count == 1 {
 		unsafe { info.thread_main(0) };
