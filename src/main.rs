@@ -3,6 +3,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::process::ExitCode;
 
+#[cfg(not(target_arch = "x86_64"))]
+fn _check_target() {
+	compile_error!("Only x86-64 target is supported.");
+}
+
 const SINGLE_THREADED: bool = true;
 
 macro_rules! include_asm {
@@ -506,6 +511,10 @@ fn print_disassembly(code: &[u8]) -> Result<(), Box<dyn Error>> {
 }
 
 fn try_main() -> Result<(), Box<dyn Error>> {
+	// needed for vpmovd2m
+	if !is_x86_feature_detected!("avx512dq") {
+		return Err("Your CPU doesn't support AVX512DQ. Sorry ):".into());
+	}
 	let arg = std::env::args().nth(1);
 	let filename = arg.unwrap_or("prospero.vm".into());
 	let text = std::fs::read_to_string(&filename)

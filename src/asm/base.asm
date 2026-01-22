@@ -31,7 +31,7 @@ mov eax, 0xbf800000
 vbroadcastss zmm0, xmm0
 vbroadcastss zmm1, xmm1
 ; zmm2 = x position
-vmovdqa64 zmm2, [rdx]
+vmovaps zmm2, [rdx]
 .loop:
 	marker
 
