@@ -192,6 +192,34 @@ impl Value {
 	}
 }
 
+struct Info {
+	code: Code,
+	pixels: PixelBuffer,
+	rows_per_thread: u16,
+	x_strides: AVX512,
+	width: u16,
+	height: u16
+}
+
+impl Info {
+	unsafe fn thread_main(&self, thread_idx: u16) {
+		let base_y = self.rows_per_thread * thread_idx;
+		let inv_width2 = 2.0 / f32::from(self.width);
+		let inv_height2 = 2.0 / f32::from(self.height);
+		let pixels = self.pixels;
+		let width = self.width;
+		let code = self.code;
+		let x_strides = &self.x_strides;
+		for y in base_y..base_y + self.rows_per_thread {
+			let pixel =
+				unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
+			unsafe {
+				code.run(pixel.ptr(), width / 16, x_strides, 16.0 * inv_width2, y as f32 * inv_height2 - 1.0)
+			};
+		}
+	}
+}
+
 fn try_main() -> Result<(), Box<dyn Error>> {
 	let arg = std::env::args().nth(1);
 	let filename = arg.unwrap_or("prospero.vm".into());
@@ -325,31 +353,29 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		data.copy_from_nonoverlapping(header.as_ptr().cast(), header.len());
 	}
 
-	let inv_width2 = 2.0 / f32::from(width);
-	let inv_height2 = 2.0 / f32::from(height);
 	let thread_count = 1;//gcd16(height, available_parallelism().unwrap_or(16));
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
 	let code = unsafe { wrap_code(include_asm!("test")) }?;
 	let mut x_strides = [0.0; 16];
 	for i in 0..16 {
-		x_strides[i] = -1.0 + i as f32 * inv_width2;
+		x_strides[i] = -1.0 + i as f32 * 2.0 / f32::from(width);
 	}
+	let rows_per_thread = height / thread_count;
 	let x_strides = AVX512(x_strides);
+	let info = Info {
+		code,
+		pixels,
+		rows_per_thread,
+		x_strides,
+		width,
+		height,
+	};
 //	std::thread::scope(|s| {
-let t = 0;
 //		for t in 0..thread_count {
 //			let ops = &ops;
-			let x_strides = &x_strides;
+	unsafe { info.thread_main(0) };
 //			s.spawn(move || {
 //				let mut buf: Box<Buf> = Box::default();
-				let rows_per_thread = height / thread_count;
-				let base_y = rows_per_thread * t;
-				for y in base_y..base_y + rows_per_thread {
-					let pixel =
-						unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
-					unsafe {
-						code.run(pixel.ptr(), width / 16, x_strides, 16.0 * inv_width2, y as f32 * inv_height2 - 1.0)
-					};
 					/*
 					for x8 in 0..width / 8 {
 						let mut byte = 0;
@@ -378,7 +404,7 @@ let t = 0;
 							pixel.write(byte);
 						}
 					}*/
-				}
+//				}
 //			});
 //		}
 //	});
