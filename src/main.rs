@@ -1,17 +1,21 @@
 use std::process::ExitCode;
+use std::collections::HashMap;
 
 #[derive(Copy, Clone, Debug)]
 enum Op {
-	Const(f32),
 	VarX,
 	VarY,
 	Mul(u16, u16),
 	Add(u16, u16),
 	Sub(u16, u16),
-	Neg(u16),
 	Sqrt(u16),
 	Max(u16, u16),
 	Min(u16, u16),
+	MulConst(u16, f32),
+	AddConst(u16, f32),
+	SubConst(u16, f32),
+	MaxConst(u16, f32),
+	MinConst(u16, f32),
 }
 
 fn parse_var(var: &str) -> u16 {
@@ -66,6 +70,109 @@ impl PixelBuffer {
 unsafe impl Send for PixelBuffer {}
 unsafe impl Sync for PixelBuffer {}
 
+enum Value {
+	Var(Op),
+	Constant(f32),
+}
+
+#[derive(Clone, Copy)]
+enum ValueId {
+	Var(u16),
+	Constant(f32),
+}
+
+impl Value {
+	fn add(a: ValueId, b: ValueId) -> Value {
+		match (a, b) {
+			(ValueId::Constant(a), ValueId::Constant(b)) => {
+				Value::Constant(a + b)
+			}
+			(ValueId::Var(a), ValueId::Var(b)) => {
+				Value::Var(Op::Add(a, b))
+			}
+			(ValueId::Var(a), ValueId::Constant(b)) => {
+				Value::Var(Op::AddConst(a, b))
+			}
+			(ValueId::Constant(a), ValueId::Var(b)) => {
+				Value::Var(Op::AddConst(b, a))
+			}
+		}
+	}
+	fn sub(a: ValueId, b: ValueId) -> Value {
+		match (a, b) {
+			(ValueId::Constant(a), ValueId::Constant(b)) => {
+				Value::Constant(a - b)
+			}
+			(ValueId::Var(a), ValueId::Var(b)) => {
+				Value::Var(Op::Sub(a, b))
+			}
+			(ValueId::Var(a), ValueId::Constant(b)) => {
+				Value::Var(Op::AddConst(a, -b))
+			}
+			(ValueId::Constant(a), ValueId::Var(b)) => {
+				Value::Var(Op::SubConst(b, a))
+			}
+		}
+	}
+	fn mul(a: ValueId, b: ValueId) -> Value {
+		match (a, b) {
+			(ValueId::Constant(a), ValueId::Constant(b)) => {
+				Value::Constant(a * b)
+			}
+			(ValueId::Var(a), ValueId::Var(b)) => {
+				Value::Var(Op::Mul(a, b))
+			}
+			(ValueId::Var(a), ValueId::Constant(b)) => {
+				Value::Var(Op::MulConst(a, b))
+			}
+			(ValueId::Constant(a), ValueId::Var(b)) => {
+				Value::Var(Op::MulConst(b, a))
+			}
+		}
+	}
+	fn min(a: ValueId, b: ValueId) -> Value {
+		match (a, b) {
+			(ValueId::Constant(a), ValueId::Constant(b)) => {
+				Value::Constant(a.min(b))
+			}
+			(ValueId::Var(a), ValueId::Var(b)) => {
+				Value::Var(Op::Min(a, b))
+			}
+			(ValueId::Var(a), ValueId::Constant(b)) => {
+				Value::Var(Op::MinConst(a, b))
+			}
+			(ValueId::Constant(a), ValueId::Var(b)) => {
+				Value::Var(Op::MinConst(b, a))
+			}
+		}
+	}
+	fn max(a: ValueId, b: ValueId) -> Value {
+		match (a, b) {
+			(ValueId::Constant(a), ValueId::Constant(b)) => {
+				Value::Constant(a.max(b))
+			}
+			(ValueId::Var(a), ValueId::Var(b)) => {
+				Value::Var(Op::Max(a, b))
+			}
+			(ValueId::Var(a), ValueId::Constant(b)) => {
+				Value::Var(Op::MaxConst(a, b))
+			}
+			(ValueId::Constant(a), ValueId::Var(b)) => {
+				Value::Var(Op::MaxConst(b, a))
+			}
+		}
+	}
+	fn sqrt(a: ValueId) -> Value {
+		match a {
+			ValueId::Constant(c) => Value::Constant(c.sqrt()),
+			ValueId::Var(o) => Value::Var(Op::Sqrt(o)),
+		}
+	}
+	fn neg(a: ValueId) -> Value {
+		Value::sub(ValueId::Constant(0.0), a)
+	}
+}
+
 fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 	let arg = std::env::args().nth(1);
 	let filename = arg.unwrap_or("prospero.vm".into());
@@ -73,6 +180,7 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 		.map_err(|e| format!("couldn't read prospero.vm: {e}"))?;
 	let mut ops = vec![];
 	let mut index = 0;
+	let mut mapping = HashMap::new();
 	for line in text.split('\n') {
 		let line = line.trim_ascii();
 		if line.starts_with('#') {
@@ -83,59 +191,67 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 		}
 		let mut words = line.split(' ');
 		let tag = words.next().unwrap();
-		_ = index;
 		debug_assert!(tag.starts_with('_') && u16::from_str_radix(&tag[1..], 16).unwrap() == index);
-		index += 1;
-
+	
 		let op = words.next().unwrap();
-		ops.push(match op {
+		let value = match op {
 			"const" => {
 				let arg: f32 = words.next().unwrap().parse().unwrap();
-				Op::Const(arg)
+				Value::Constant(arg)
 			}
-			"var-x" => Op::VarX,
-			"var-y" => Op::VarY,
+			"var-x" => Value::Var(Op::VarX),
+			"var-y" => Value::Var(Op::VarY),
 			"add" => {
-				let arg1 = words.next().unwrap();
-				let arg2 = words.next().unwrap();
-				Op::Add(parse_var(arg1), parse_var(arg2))
+				let arg1 = mapping[&parse_var(words.next().unwrap())];
+				let arg2 = mapping[&parse_var(words.next().unwrap())];
+				Value::add(arg1, arg2)
 			}
 			"sub" => {
-				let arg1 = words.next().unwrap();
-				let arg2 = words.next().unwrap();
-				Op::Sub(parse_var(arg1), parse_var(arg2))
+				let arg1 = mapping[&parse_var(words.next().unwrap())];
+				let arg2 = mapping[&parse_var(words.next().unwrap())];
+				Value::sub(arg1, arg2)
 			}
 			"mul" => {
-				let arg1 = words.next().unwrap();
-				let arg2 = words.next().unwrap();
-				Op::Mul(parse_var(arg1), parse_var(arg2))
+				let arg1 = mapping[&parse_var(words.next().unwrap())];
+				let arg2 = mapping[&parse_var(words.next().unwrap())];
+				Value::mul(arg1, arg2)
 			}
 			"min" => {
-				let arg1 = words.next().unwrap();
-				let arg2 = words.next().unwrap();
-				Op::Min(parse_var(arg1), parse_var(arg2))
+				let arg1 = mapping[&parse_var(words.next().unwrap())];
+				let arg2 = mapping[&parse_var(words.next().unwrap())];
+				Value::min(arg1, arg2)
 			}
 			"max" => {
-				let arg1 = words.next().unwrap();
-				let arg2 = words.next().unwrap();
-				Op::Max(parse_var(arg1), parse_var(arg2))
+				let arg1 = mapping[&parse_var(words.next().unwrap())];
+				let arg2 = mapping[&parse_var(words.next().unwrap())];
+				Value::max(arg1, arg2)
 			}
 			"neg" => {
-				let arg = words.next().unwrap();
-				Op::Neg(parse_var(arg))
+				let arg = mapping[&parse_var(words.next().unwrap())];
+				Value::neg(arg)
 			}
 			"sqrt" => {
-				let arg = words.next().unwrap();
-				Op::Sqrt(parse_var(arg))
+				let arg = mapping[&parse_var(words.next().unwrap())];
+				Value::sqrt(arg)
 			}
 			"square" => {
-				let arg = parse_var(words.next().unwrap());
-				Op::Mul(arg, arg)
+				let arg = mapping[&parse_var(words.next().unwrap())];
+				Value::mul(arg, arg)
 			}
 			_ => {
 				panic!("bad format: {op}");
 			}
-		});
+		};
+		match value {
+			Value::Constant(c) => {
+				mapping.insert(index, ValueId::Constant(c));
+			}
+			Value::Var(op) => {
+				mapping.insert(index, ValueId::Var(ops.len() as _));
+				ops.push(op);
+			}
+		}
+		index = index.checked_add(1).ok_or("too many lines")?;
 	}
 	const BIT_OFFSET: u32 = 2 + 4 * 3 + 4 + 2 * 4 + 2 * 3;
 	let width: u16 = 512;
@@ -209,7 +325,6 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 						for bit in 0..8 {
 							for (i, op) in ops.iter().copied().enumerate() {
 								let val = match op {
-									Op::Const(v) => v,
 									Op::Add(x, y) => buf.get(x) + buf.get(y),
 									Op::Sub(x, y) => buf.get(x) - buf.get(y),
 									Op::Mul(x, y) => buf.get(x) * buf.get(y),
@@ -217,8 +332,13 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 									Op::Max(x, y) => buf.get(x).max(buf.get(y)),
 									Op::VarX => (x8 * 8 + bit) as f32 * inv_width2 - 1.0,
 									Op::VarY => y as f32 * inv_height2 - 1.0,
-									Op::Neg(x) => -buf.get(x),
 									Op::Sqrt(x) => buf.get(x).sqrt(),
+									Op::AddConst(x, y) => buf.get(x) + y,
+									Op::SubConst(x, y) => y - buf.get(x),
+									Op::MulConst(x, y) => buf.get(x) * y,
+									Op::MinConst(x, y) => buf.get(x).min(y),
+									Op::MaxConst(x, y) => buf.get(x).max(y),
+									
 								};
 								buf.set(i, val);
 							}
