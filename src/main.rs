@@ -172,6 +172,9 @@ impl ZmmValue {
 	fn as_ptr(&self) -> *const f32 {
 		self.0.as_ptr()
 	}
+	fn constant(value: f32) -> Self {
+		Self([value; 16])
+	}
 }
 
 enum Value {
@@ -373,6 +376,7 @@ enum LowLevelOp {
 	Sqrt(u8, Location),
 	Min(u8, u8, Location),
 	Max(u8, u8, Location),
+	Negate(u8),
 }
 
 fn zmm_dest_bits(r: u8) -> (u8, u8) {
@@ -486,6 +490,12 @@ impl LowLevelOp {
 				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c, 0x48, 0x51, 0x80 ^ d2]);
 				bytes.write_u32(src * 64);
 			}
+			Self::Negate(r) => {
+				// vxorps zmmA, zmmA, [r8]
+				let (d1, d2) = zmm_dest_bits(r);
+				let (s1, s2) = zmm_src1_bits(r);
+				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s1, 0x48 ^ s2, 0x57, d2]);
+			}
 		}
 	}
 }
@@ -577,7 +587,10 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		thread_count >>= 1;
 	}
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
-	let low_level_ops = [LowLevelOp::Mul(3, 1, Location::Zmm(2))];
+	let low_level_ops = [
+		LowLevelOp::Mul(3, 1, Location::Zmm(2)),
+		LowLevelOp::Negate(3),
+	];
 	let mut core = vec![0u8; low_level_ops.len() * 16];
 	let mut rest = &mut core[..];
 	for op in low_level_ops.iter().copied() {
@@ -596,6 +609,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	}
 	let rows_per_thread = height / thread_count;
 	let x_strides = ZmmValue(x_strides);
+	let constants = vec![ZmmValue::constant(-1.0)];
 	let info = Info {
 		code,
 		pixels,
@@ -603,7 +617,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		x_strides,
 		width,
 		height,
-		constants: vec![ZmmValue::default(); 10_000], //TODO
+		constants,
 	};
 	if thread_count == 1 {
 		unsafe { info.thread_main(0) };
