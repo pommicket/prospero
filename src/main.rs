@@ -1,4 +1,3 @@
-#![allow(dead_code)] //TODO
 use std::collections::HashMap;
 use std::error::Error;
 use std::process::ExitCode;
@@ -9,6 +8,10 @@ fn _check_target() {
 }
 
 const SINGLE_THREADED: bool = true;
+const ZMM_X: u8 = 2;
+const ZMM_Y: u8 = 1;
+const ZMM_SCRATCH: u8 = 3;
+const ZMM_OUTPUT: u8 = 3;
 
 macro_rules! include_asm {
 	($name:literal) => {
@@ -16,7 +19,6 @@ macro_rules! include_asm {
 	};
 }
 
-#[allow(dead_code)] // TODO
 #[derive(Copy, Clone, Debug)]
 enum Op {
 	VarX,
@@ -248,6 +250,7 @@ struct Info {
 	width: u16,
 	height: u16,
 	constants: Vec<ZmmValue>,
+	buffer_entries_needed: u32,
 }
 
 impl Info {
@@ -259,8 +262,7 @@ impl Info {
 		let width = self.width;
 		let code = self.code;
 		let x_strides = &self.x_strides;
-		// TODO: pick correct size for buffer
-		let mut buffer = vec![ZmmValue::default(); 10_000];
+		let mut buffer = vec![ZmmValue::default(); self.buffer_entries_needed as usize];
 		let constants = &self.constants;
 		for y in base_y..base_y + self.rows_per_thread {
 			let pixel = unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
@@ -365,8 +367,24 @@ enum Location {
 	Constant(u32),
 }
 
+impl Location {
+	fn load_zmm(self, instructions: &mut Vec<Instruction>) -> u8 {
+		match self {
+			Self::Zmm(n) => n,
+			Self::Buffer(x) => {
+				instructions.push(Instruction::LoadBuffer(ZMM_SCRATCH, x));
+				ZMM_SCRATCH
+			}
+			Self::Constant(x) => {
+				instructions.push(Instruction::LoadConstant(ZMM_SCRATCH, x));
+				ZMM_SCRATCH
+			}
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug)]
-enum LowLevelOp {
+enum Instruction {
 	LoadBuffer(u8, u32),
 	LoadConstant(u8, u32),
 	StoreBuffer(u32, u8),
@@ -376,7 +394,7 @@ enum LowLevelOp {
 	Sqrt(u8, Location),
 	Min(u8, u8, Location),
 	Max(u8, u8, Location),
-	Negate(u8),
+	Negate(u8, u8),
 }
 
 fn zmm_dest_bits(r: u8) -> (u8, u8) {
@@ -446,7 +464,7 @@ fn binary_op_to_bytes(bytes: &mut impl ByteWriter, op: u8, dest: u8, src1: u8, s
 	}
 }
 
-impl LowLevelOp {
+impl Instruction {
 	fn to_bytes(self, bytes: &mut impl ByteWriter) {
 		match self {
 			Self::LoadConstant(r, offset) => {
@@ -490,10 +508,10 @@ impl LowLevelOp {
 				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c, 0x48, 0x51, 0x80 ^ d2]);
 				bytes.write_u32(src * 64);
 			}
-			Self::Negate(r) => {
-				// vxorps zmmA, zmmA, [r8]
-				let (d1, d2) = zmm_dest_bits(r);
-				let (s1, s2) = zmm_src1_bits(r);
+			Self::Negate(dest, src) => {
+				// vxorps zmmA, zmmB, [r8]
+				let (d1, d2) = zmm_dest_bits(dest);
+				let (s1, s2) = zmm_src1_bits(src);
 				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s1, 0x48 ^ s2, 0x57, d2]);
 			}
 		}
@@ -520,6 +538,215 @@ fn print_disassembly(code: &[u8]) -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
+struct CompilationResult {
+	constants: Vec<ZmmValue>,
+	instructions: Vec<Instruction>,
+	buffer_entries_needed: u32,
+}
+
+#[derive(Default)]
+struct ConstantList {
+	array: Vec<ZmmValue>,
+	map: HashMap<u32, u32>,
+}
+
+impl ConstantList {
+	fn add(&mut self, constant: f32) -> u32 {
+		// must ensure 64*constant_id is a valid immediate 32-bit offset
+		assert!(self.array.len() < (1 << 25));
+		if let Some(id) = self.map.get(&constant.to_bits()).copied() {
+			return id;
+		}
+		let id = self.array.len() as u32;
+		self.array.push(ZmmValue::constant(constant));
+		self.map.insert(constant.to_bits(), id);
+		id
+	}
+}
+
+struct Compiler {
+	buffer_idx: u32,
+	instructions: Vec<Instruction>,
+	locations: Vec<Location>,
+}
+
+impl Compiler {
+	#[must_use]
+	fn compile_binop_with_constant(
+		&mut self,
+		constructor: impl FnOnce(u8, u8, Location, &mut Vec<Instruction>),
+		arg: Location,
+		constant: u32,
+	) -> Location {
+		let zmm = arg.load_zmm(&mut self.instructions);
+		constructor(
+			ZMM_SCRATCH,
+			zmm,
+			Location::Constant(constant),
+			&mut self.instructions,
+		);
+		let idx = self.buffer_idx;
+		self.buffer_idx += 1;
+		self.instructions
+			.push(Instruction::StoreBuffer(idx, ZMM_SCRATCH));
+		Location::Buffer(idx)
+	}
+	#[must_use]
+	fn compile_binop(
+		&mut self,
+		constructor: impl FnOnce(u8, u8, Location) -> Instruction,
+		arg1: Location,
+		arg2: Location,
+	) -> Location {
+		let zmm1 = arg1.load_zmm(&mut self.instructions);
+		let idx = self.buffer_idx;
+		self.buffer_idx += 1;
+		self.instructions.push(constructor(ZMM_SCRATCH, zmm1, arg2));
+		self.instructions
+			.push(Instruction::StoreBuffer(idx, ZMM_SCRATCH));
+		Location::Buffer(idx)
+	}
+	#[must_use]
+	fn compile_unary(
+		&mut self,
+		constructor: impl FnOnce(u8, Location) -> Instruction,
+		arg: Location,
+	) -> Location {
+		self.instructions.push(constructor(ZMM_SCRATCH, arg));
+		let idx = self.buffer_idx;
+		self.buffer_idx += 1;
+		self.instructions
+			.push(Instruction::StoreBuffer(idx, ZMM_SCRATCH));
+		Location::Buffer(idx)
+	}
+}
+
+fn compile_down(ops: Vec<Op>) -> CompilationResult {
+	let mut constants = ConstantList::default();
+	constants.add(-1.0);
+	let mut compiler = Compiler {
+		instructions: vec![],
+		locations: vec![],
+		buffer_idx: 0,
+	};
+	for op in ops.iter().copied() {
+		let location = match op {
+			Op::VarX => Location::Zmm(ZMM_X),
+			Op::VarY => Location::Zmm(ZMM_Y),
+			Op::AddConst(arg, constant) => {
+				let constant = constants.add(constant);
+				let arg = compiler.locations[arg as usize];
+				compiler.compile_binop_with_constant(
+					|d, s1, s2, instructions| {
+						instructions.push(Instruction::Add(d, s1, s2));
+					},
+					arg,
+					constant,
+				)
+			}
+			Op::MulConst(arg, constant) => {
+				let constant = constants.add(constant);
+				let arg = compiler.locations[arg as usize];
+				compiler.compile_binop_with_constant(
+					|d, s1, s2, instructions| {
+						instructions.push(Instruction::Mul(d, s1, s2));
+					},
+					arg,
+					constant,
+				)
+			}
+			Op::MinConst(arg, constant) => {
+				let constant = constants.add(constant);
+				let arg = compiler.locations[arg as usize];
+				compiler.compile_binop_with_constant(
+					|d, s1, s2, instructions| {
+						instructions.push(Instruction::Min(d, s1, s2));
+					},
+					arg,
+					constant,
+				)
+			}
+			Op::MaxConst(arg, constant) => {
+				let constant = constants.add(constant);
+				let arg = compiler.locations[arg as usize];
+				compiler.compile_binop_with_constant(
+					|d, s1, s2, instructions| {
+						instructions.push(Instruction::Max(d, s1, s2));
+					},
+					arg,
+					constant,
+				)
+			}
+			Op::SubConst(arg, constant) => {
+				let constant = constants.add(constant);
+				let arg = compiler.locations[arg as usize];
+				compiler.compile_binop_with_constant(
+					|d, s1, s2, instructions| {
+						instructions.push(Instruction::Negate(d, s1));
+						instructions.push(Instruction::Add(d, d, s2));
+					},
+					arg,
+					constant,
+				)
+			}
+			Op::Add(arg1, arg2) => {
+				let arg1 = compiler.locations[arg1 as usize];
+				let arg2 = compiler.locations[arg2 as usize];
+				compiler.compile_binop(Instruction::Add, arg1, arg2)
+			}
+			Op::Sub(arg1, arg2) => {
+				let arg1 = compiler.locations[arg1 as usize];
+				let arg2 = compiler.locations[arg2 as usize];
+				compiler.compile_binop(Instruction::Sub, arg1, arg2)
+			}
+			Op::Min(arg1, arg2) => {
+				let arg1 = compiler.locations[arg1 as usize];
+				let arg2 = compiler.locations[arg2 as usize];
+				compiler.compile_binop(Instruction::Min, arg1, arg2)
+			}
+			Op::Max(arg1, arg2) => {
+				let arg1 = compiler.locations[arg1 as usize];
+				let arg2 = compiler.locations[arg2 as usize];
+				compiler.compile_binop(Instruction::Max, arg1, arg2)
+			}
+			Op::Mul(arg1, arg2) => {
+				let arg1 = compiler.locations[arg1 as usize];
+				let arg2 = compiler.locations[arg2 as usize];
+				compiler.compile_binop(Instruction::Mul, arg1, arg2)
+			}
+			Op::Sqrt(arg) => {
+				let arg = compiler.locations[arg as usize];
+				compiler.compile_unary(Instruction::Sqrt, arg)
+			}
+		};
+		compiler.locations.push(location);
+	}
+	let Compiler {
+		mut instructions,
+		locations,
+		buffer_idx,
+	} = compiler;
+	match *locations.last().unwrap() {
+		Location::Buffer(b) => {
+			instructions.push(Instruction::LoadBuffer(ZMM_OUTPUT, b));
+		}
+		Location::Constant(c) => {
+			instructions.push(Instruction::LoadConstant(ZMM_OUTPUT, c));
+		}
+		Location::Zmm(z) => {
+			if z != ZMM_OUTPUT {
+				instructions.push(Instruction::StoreBuffer(0, z));
+				instructions.push(Instruction::LoadBuffer(ZMM_OUTPUT, 0));
+			}
+		}
+	}
+	CompilationResult {
+		constants: constants.array,
+		instructions,
+		buffer_entries_needed: buffer_idx,
+	}
+}
+
 fn try_main() -> Result<(), Box<dyn Error>> {
 	// needed for vpmovd2m
 	if !is_x86_feature_detected!("avx512dq") {
@@ -529,10 +756,10 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	let filename = arg.unwrap_or("prospero.vm".into());
 	let text = std::fs::read_to_string(&filename)
 		.map_err(|e| format!("couldn't read prospero.vm: {e}"))?;
-	let _ops = read_ops(text)?;
+	let ops = read_ops(text)?;
 	const BIT_OFFSET: u32 = 2 + 4 * 3 + 4 + 2 * 4 + 2 * 3;
-	let width: u16 = 4096;
-	let height: u16 = 4096;
+	let width: u16 = 256;
+	let height: u16 = 256;
 	if !width.is_multiple_of(16) {
 		return Err(format!("width {width} should be a multiple of 16").into());
 	}
@@ -587,13 +814,14 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		thread_count >>= 1;
 	}
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
-	let low_level_ops = [
-		LowLevelOp::Mul(3, 1, Location::Zmm(2)),
-		LowLevelOp::Negate(3),
-	];
-	let mut core = vec![0u8; low_level_ops.len() * 16];
+	let CompilationResult {
+		instructions,
+		constants,
+		buffer_entries_needed,
+	} = compile_down(ops);
+	let mut core = vec![0u8; instructions.len() * 16];
 	let mut rest = &mut core[..];
-	for op in low_level_ops.iter().copied() {
+	for op in instructions.iter().copied() {
 		op.to_bytes(&mut rest);
 	}
 	let rest_len = rest.len();
@@ -609,7 +837,6 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	}
 	let rows_per_thread = height / thread_count;
 	let x_strides = ZmmValue(x_strides);
-	let constants = vec![ZmmValue::constant(-1.0)];
 	let info = Info {
 		code,
 		pixels,
@@ -618,6 +845,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		width,
 		height,
 		constants,
+		buffer_entries_needed,
 	};
 	if thread_count == 1 {
 		unsafe { info.thread_main(0) };
