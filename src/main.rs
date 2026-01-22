@@ -431,6 +431,12 @@ fn binary_op_to_bytes(bytes: &mut impl ByteWriter, op: u8, dest: u8, src1: u8, s
 impl LowLevelOp {
 	fn to_bytes(self, bytes: &mut impl ByteWriter) {
 		match self {
+			Self::LoadConstant(r, offset) => {
+				let (mask1, mask2) = zmm_dest_bits(r);
+				// vmovaps zmmA, [r8+offset]
+				bytes.write(&[0x62, 0xd1 ^ mask1, 0x7c, 0x48, 0x28, 0x80 | mask2]);
+				bytes.write_u32(offset * 64);
+			}
 			Self::LoadBuffer(r, offset) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
 				// vmovaps zmmA, [rcx+offset]
@@ -448,7 +454,24 @@ impl LowLevelOp {
 			Self::Mul(dest, src1, src2) => binary_op_to_bytes(bytes, 0x59, dest, src1, src2),
 			Self::Min(dest, src1, src2) => binary_op_to_bytes(bytes, 0x5d, dest, src1, src2),
 			Self::Max(dest, src1, src2) => binary_op_to_bytes(bytes, 0x5f, dest, src1, src2),
-			_ => todo!(),
+			Self::Sqrt(dest, Location::Zmm(src)) => {
+				let (d1, d2) = zmm_dest_bits(dest);
+				let (s1, s2) = zmm_src2_bits(src);
+				// vsqrtps zmmA, zmmB
+				bytes.write(&[0x62, 0xf1 ^ d1 ^ s1, 0x7c, 0x48, 0x51, 0xc0 ^ d2 ^ s2]);
+			}
+			Self::Sqrt(dest, Location::Buffer(src)) => {
+				let (d1, d2) = zmm_dest_bits(dest);
+				// vsqrtps zmmA, [rcx+offset]
+				bytes.write(&[0x62, 0xf1 ^ d1, 0x7c, 0x48, 0x51, 0x81 ^ d2]);
+				bytes.write_u32(src * 64);
+			}
+			Self::Sqrt(dest, Location::Constant(src)) => {
+				let (d1, d2) = zmm_dest_bits(dest);
+				// vsqrtps zmmA, [r8+offset]
+				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c, 0x48, 0x51, 0x80 ^ d2]);
+				bytes.write_u32(src * 64);
+			}
 		}
 	}
 }
@@ -536,12 +559,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		thread_count >>= 1;
 	}
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
-	let low_level_ops = [
-		LowLevelOp::StoreBuffer(123, 1),
-		LowLevelOp::LoadBuffer(12, 123),
-		LowLevelOp::StoreBuffer(456, 2),
-		LowLevelOp::Mul(3, 12, Location::Buffer(456)),
-	];
+	let low_level_ops = [LowLevelOp::Mul(3, 1, Location::Zmm(2))];
 	let mut core = vec![0u8; low_level_ops.len() * 16];
 	let mut rest = &mut core[..];
 	for op in low_level_ops.iter().copied() {
