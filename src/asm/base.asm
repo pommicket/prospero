@@ -32,39 +32,24 @@ vbroadcastss zmm1, xmm1
 vmovdqa64 zmm2, [rdx]
 .loop:
 	marker
+
 	; zmm3 = result
-	vpmovd2m k1, zmm3
-	kmovw eax, k1
-	not eax
 
 ; unfortunately, BMP, unlike all other file formats on the planet,
 ; treats the most significant bit of a byte as bit 0
-; so we have to swap around the bits in each byte
-; compiled from Rust code:
-;   pub fn foo(num: u16) -> u16 {
-;       num.swap_bytes().reverse_bits()
-;   }
-	push rdi
-	push rcx
-        mov     edi, eax
-        and     eax, 3855
-        shl     eax, 4
-        shr     edi, 4
-        and     edi, 3855
-        or      edi, eax
-        mov     eax, edi
-        and     eax, 13107
-        shr     edi, 2
-        and     edi, 13107
-        lea     eax, [rdi + 4*rax]
-        mov     ecx, eax
-        and     ecx, 21845
-        shr     eax, 1
-        and     eax, 21845
-        lea     eax, [rax + 2*rcx]
-        pop rcx
-        pop rdi
+; so we have to shuffle around the values
+; 27 = 0b00 01 10 11
+	vpshufd zmm3, zmm3, 27
 
+; extract sign bit from each float in zmm3. kind of a miracle that this exists!
+	vpmovd2m k1, zmm3
+	kmovw eax, k1
+; sign bit set -> negative -> should be black (0)
+; sign bit unset -> positive -> should be white (1)
+	not eax
+; reverse groups of 4 bits in each byte
+	ror al, 4
+	ror ah, 4
 
 	mov [rdi], ax
 	add rdi, 2
