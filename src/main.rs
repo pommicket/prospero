@@ -85,9 +85,20 @@ struct Code(*mut u8);
 unsafe impl Send for Code {}
 unsafe impl Sync for Code {}
 impl Code {
-	unsafe fn run(self, output_data: *mut u8, count: u16, x_strides: &[f32; 16], y_pos: f32, stride16: f32) {
+	unsafe fn run(self, output_data: *mut u8, count: u16, x_strides: &AVX512, stride16: f32, y_pos: f32) {
 		let function: unsafe extern "C" fn (*mut u8, u64, *const f32, f32, f32) = unsafe { std::mem::transmute(self.0) };
-		unsafe { function(output_data, count.into(), x_strides.as_ptr(), y_pos, stride16) };
+		let count: u64 = count.into();
+		let x_strides: *const f32 = x_strides.as_ptr();
+		unsafe { function(output_data, count, x_strides, stride16, y_pos) };
+	}
+}
+
+#[derive(Copy, Clone)]
+#[repr(C, align(64))]
+struct AVX512([f32; 16]);
+impl AVX512 {
+	fn as_ptr(&self) -> *const f32 {
+		self.0.as_ptr()
 	}
 }
 
@@ -289,19 +300,28 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 
 	let inv_width2 = 2.0 / f32::from(width);
 	let inv_height2 = 2.0 / f32::from(height);
-	let thread_count = gcd16(height, available_parallelism().unwrap_or(16));
+	let thread_count = 1;//gcd16(height, available_parallelism().unwrap_or(16));
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
 	let base_template = include_asm!("base");
-	let start_index = base_template.windows(16).position(|win| win == &[0xcc; 16]).expect("bad ASM");
+	let marker_idx = base_template.windows(16).position(|win| win == &[0xcc; 16]).expect("bad ASM");
+	let base_template_prefix = &base_template[..marker_idx];
+	let base_template_suffix = &base_template[marker_idx + 16..];
 	let injection = include_asm!("test");
 	let code = unsafe { libc::mmap(std::ptr::null_mut(), 1<<20, libc::PROT_READ|libc::PROT_WRITE, libc::MAP_ANONYMOUS|libc::MAP_PRIVATE, -1, 0) };
 	if code == libc::MAP_FAILED {
 		return Err("mmap failed".into());
 	}
 	let code: *mut u8 = code.cast();
-	unsafe { code.copy_from_nonoverlapping(base_template.as_ptr(), start_index); }
-	unsafe { code.add(start_index).copy_from_nonoverlapping(injection.as_ptr(), injection.len()); }
-	unsafe { code.add(start_index + injection.len()).copy_from_nonoverlapping(base_template.as_ptr().add(start_index), base_template.len() - start_index); }
+	unsafe { code.copy_from_nonoverlapping(base_template_prefix.as_ptr(), base_template_prefix.len()); }
+	let ptr = unsafe { code.add(base_template_prefix.len()) };
+	unsafe { ptr.copy_from_nonoverlapping(injection.as_ptr(), injection.len()); }
+	let ptr = unsafe { ptr.add(injection.len()) };
+	unsafe { ptr.copy_from_nonoverlapping(base_template_suffix.as_ptr(), base_template_suffix.len()); }
+	let ptr = unsafe { ptr.add(base_template_suffix.len()) };
+	let jump_offset = -((injection.len() + base_template_suffix.len() + 6) as i32);
+	let [j0, j1, j2, j3] = jump_offset.to_le_bytes();
+	let epilogue = [0x0f, 0x8f, j0, j1, j2, j3, 0xc3];
+	unsafe { ptr.copy_from_nonoverlapping(epilogue.as_ptr(), epilogue.len()) };
 	if unsafe { libc::mprotect(code.cast(), 1<<20, libc::PROT_EXEC) } != 0 {
 		return Err("mprotect failed".into());
 	}
@@ -310,6 +330,7 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 	for i in 0..16 {
 		x_strides[i] = -1.0 + i as f32 * inv_width2;
 	}
+	let x_strides = AVX512(x_strides);
 //	std::thread::scope(|s| {
 let t = 0;
 //		for t in 0..thread_count {
@@ -323,7 +344,7 @@ let t = 0;
 					let pixel =
 						unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
 					unsafe {
-						code.run(pixel.ptr(), width / 16, x_strides, y as f32 * inv_height2 - 1.0, 16.0 * inv_width2)
+						code.run(pixel.ptr(), width / 16, x_strides, 16.0 * inv_width2, y as f32 * inv_height2 - 1.0)
 					};
 					/*
 					for x8 in 0..width / 8 {

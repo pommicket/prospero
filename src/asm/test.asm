@@ -1,1 +1,1 @@
-vmovaps zmm3, zmm2
+vaddps zmm3, zmm1, zmm2
