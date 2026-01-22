@@ -395,6 +395,39 @@ impl ByteWriter for &mut [u8] {
 	}
 }
 
+fn binary_op_to_bytes(bytes: &mut impl ByteWriter, op: u8, dest: u8, src1: u8, src2: Location) {
+	match src2 {
+		Location::Zmm(src2) => {
+			let (d1, d2) = zmm_dest_bits(dest);
+			let (s11, s12) = zmm_src1_bits(src1);
+			let (s21, s22) = zmm_src2_bits(src2);
+			// vaddps zmmA, zmmB, zmmC
+			bytes.write(&[
+				0x62,
+				0xf1 ^ d1 ^ s21,
+				0x7c ^ s11,
+				0x48 ^ s12,
+				op,
+				0xc0 ^ s22 ^ d2,
+			]);
+		}
+		Location::Buffer(src2) => {
+			let (d1, d2) = zmm_dest_bits(dest);
+			let (s11, s12) = zmm_src1_bits(src1);
+			// vaddps zmmA, zmmB, [rcx+offset]
+			bytes.write(&[0x62, 0xf1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, op, 0x81 ^ d2]);
+			bytes.write_u32(src2 * 64);
+		}
+		Location::Constant(src2) => {
+			let (d1, d2) = zmm_dest_bits(dest);
+			let (s11, s12) = zmm_src1_bits(src1);
+			// vaddps zmmA, zmmB, [r8+offset]
+			bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, op, 0x80 ^ d2]);
+			bytes.write_u32(src2 * 64);
+		}
+	}
+}
+
 impl LowLevelOp {
 	fn to_bytes(self, bytes: &mut impl ByteWriter) {
 		match self {
@@ -410,34 +443,11 @@ impl LowLevelOp {
 				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x29, 0x81 | mask2]);
 				bytes.write_u32(offset * 64);
 			}
-			Self::Add(dest, src1, Location::Zmm(src2)) => {
-				let (d1, d2) = zmm_dest_bits(dest);
-				let (s11, s12) = zmm_src1_bits(src1);
-				let (s21, s22) = zmm_src2_bits(src2);
-				// vaddps zmmA, zmmB, zmmC
-				bytes.write(&[
-					0x62,
-					0xf1 ^ d1 ^ s21,
-					0x7c ^ s11,
-					0x48 ^ s12,
-					0x58,
-					0xc0 ^ s22 ^ d2,
-				]);
-			}
-			Self::Add(dest, src1, Location::Buffer(src2)) => {
-				let (d1, d2) = zmm_dest_bits(dest);
-				let (s11, s12) = zmm_src1_bits(src1);
-				// vaddps zmmA, zmmB, [rcx+offset]
-				bytes.write(&[0x62, 0xf1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, 0x58, 0x81 ^ d2]);
-				bytes.write_u32(src2 * 64);
-			}
-			Self::Add(dest, src1, Location::Constant(src2)) => {
-				let (d1, d2) = zmm_dest_bits(dest);
-				let (s11, s12) = zmm_src1_bits(src1);
-				// vaddps zmmA, zmmB, [r8+offset]
-				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, 0x58, 0x80 ^ d2]);
-				bytes.write_u32(src2 * 64);
-			}
+			Self::Add(dest, src1, src2) => binary_op_to_bytes(bytes, 0x58, dest, src1, src2),
+			Self::Sub(dest, src1, src2) => binary_op_to_bytes(bytes, 0x5c, dest, src1, src2),
+			Self::Mul(dest, src1, src2) => binary_op_to_bytes(bytes, 0x59, dest, src1, src2),
+			Self::Min(dest, src1, src2) => binary_op_to_bytes(bytes, 0x5d, dest, src1, src2),
+			Self::Max(dest, src1, src2) => binary_op_to_bytes(bytes, 0x5f, dest, src1, src2),
 			_ => todo!(),
 		}
 	}
@@ -530,7 +540,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		LowLevelOp::StoreBuffer(123, 1),
 		LowLevelOp::LoadBuffer(12, 123),
 		LowLevelOp::StoreBuffer(456, 2),
-		LowLevelOp::Add(3, 12, Location::Constant(456)),
+		LowLevelOp::Mul(3, 12, Location::Buffer(456)),
 	];
 	let mut core = vec![0u8; low_level_ops.len() * 16];
 	let mut rest = &mut core[..];
