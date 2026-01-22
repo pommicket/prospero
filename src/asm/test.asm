@@ -1,3 +1,5 @@
+BITS 64
+
 vmulps zmm4, zmm1, zmm1
 vsqrtps zmm4, zmm4
 vsqrtps zmm4, zmm4

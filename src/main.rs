@@ -1,3 +1,4 @@
+#![allow(dead_code)]//TODO
 use std::collections::HashMap;
 use std::error::Error;
 use std::process::ExitCode;
@@ -68,15 +69,19 @@ impl Code {
 		self,
 		output_data: *mut u8,
 		count: u16,
-		x_strides: &AVX512,
+		x_strides: &ZMMValue,
 		stride16: f32,
 		y_pos: f32,
+		buffer: &mut [ZMMValue],
+		constants: &[ZMMValue],
 	) {
-		let function: unsafe extern "C" fn(*mut u8, u64, *const f32, f32, f32) =
+		let function: unsafe extern "sysv64" fn(*mut u8, u64, *const f32, f32, f32, *mut ZMMValue, *const ZMMValue) =
 			unsafe { std::mem::transmute(self.0) };
 		let count: u64 = count.into();
 		let x_strides: *const f32 = x_strides.as_ptr();
-		unsafe { function(output_data, count, x_strides, stride16, y_pos) };
+		let buffer = buffer.as_mut_ptr();
+		let constants = constants.as_ptr();
+		unsafe { function(output_data, count, x_strides, stride16, y_pos, buffer, constants) };
 	}
 }
 
@@ -128,10 +133,10 @@ unsafe fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
 	Ok(Code(code))
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 #[repr(C, align(64))]
-struct AVX512([f32; 16]);
-impl AVX512 {
+struct ZMMValue([f32; 16]);
+impl ZMMValue {
 	fn as_ptr(&self) -> *const f32 {
 		self.0.as_ptr()
 	}
@@ -204,9 +209,10 @@ struct Info {
 	code: Code,
 	pixels: PixelBuffer,
 	rows_per_thread: u16,
-	x_strides: AVX512,
+	x_strides: ZMMValue,
 	width: u16,
 	height: u16,
+	constants: Vec<ZMMValue>,
 }
 
 impl Info {
@@ -218,6 +224,9 @@ impl Info {
 		let width = self.width;
 		let code = self.code;
 		let x_strides = &self.x_strides;
+		// TODO: pick correct size for buffer
+		let mut buffer = vec![ZMMValue::default(); 10_000];
+		let constants = &self.constants;
 		for y in base_y..base_y + self.rows_per_thread {
 			let pixel = unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
 			unsafe {
@@ -227,17 +236,15 @@ impl Info {
 					x_strides,
 					16.0 * inv_width2,
 					y as f32 * inv_height2 - 1.0,
+					&mut buffer,
+					constants,
 				)
 			};
 		}
 	}
 }
 
-fn try_main() -> Result<(), Box<dyn Error>> {
-	let arg = std::env::args().nth(1);
-	let filename = arg.unwrap_or("prospero.vm".into());
-	let text = std::fs::read_to_string(&filename)
-		.map_err(|e| format!("couldn't read prospero.vm: {e}"))?;
+fn read_ops(text: String) -> Result<Vec<Op>, Box<dyn Error>> {
 	let mut ops = vec![];
 	let mut index = 0;
 	let mut mapping = HashMap::new();
@@ -313,6 +320,98 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		}
 		index = index.checked_add(1).ok_or("too many lines")?;
 	}
+	Ok(ops)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Location {
+	ZMM(u8),
+	Buffer(u32),
+	Constant(u32),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LowLevelOp {
+	LoadBuffer(u8, u32),
+	LoadConstant(u8, u32),
+	StoreBuffer(u32, u8),
+	Add(u8, u8, Location),
+	Sub(u8, u8, Location),
+	Mul(u8, u8, Location),
+	Sqrt(u8, Location),
+	Min(u8, u8, Location),
+	Max(u8, u8, Location),
+}
+
+fn zmm_dest_bits(r: u8) -> (u8, u8) {
+	let bit4 = r >> 4;
+	let bit3 = (r >> 3) & 1;
+	let bits012 = r & 7;
+	((bit3 << 7) | (bit4 << 4), bits012 << 3)
+}
+
+fn zmm_src1_bits(r: u8) -> (u8, u8) {
+	let bit4 = r >> 4;
+	let bit0123 = r & 15;
+	(bit0123 << 3, bit4 << 3)
+}
+
+fn zmm_src2_bits(r: u8) -> (u8, u8) {
+	let bit34 = r >> 3;
+	let bit012 = r & 7;
+	(bit34 << 5, bit012)
+}
+
+trait ByteWriter {
+	fn write(&mut self, bytes: &[u8]);
+	fn write_u32(&mut self, value: u32) {
+		self.write(&value.to_le_bytes());
+	}
+}
+
+impl ByteWriter for &mut [u8] {
+	fn write(&mut self, bytes: &[u8]) {
+		self.split_off_mut(..bytes.len()).unwrap().copy_from_slice(bytes);
+	}
+}
+
+impl LowLevelOp {
+	fn to_bytes(self, bytes: &mut impl ByteWriter) {
+		match self {
+			Self::LoadBuffer(r, offset) => {
+				let (mask1, mask2) = zmm_dest_bits(r);
+				// vmovaps zmmA, [rcx+offset]
+				bytes.write(
+					&[0x62,0xf1 ^ mask1,0x7c,0x48,0x28,0x81 | mask2]
+				);
+				bytes.write_u32(offset * 64);
+			}
+			Self::StoreBuffer(offset, r) => {
+				let (mask1, mask2) = zmm_dest_bits(r);
+				// vmovaps [rcx+offset], zmmA
+				bytes.write(
+					&[0x62,0xf1 ^ mask1,0x7c,0x48,0x29,0x81 | mask2]
+				);
+				bytes.write_u32(offset * 64);
+			}
+			Self::Add(dest, src1, Location::ZMM(src2)) => {
+				let (d1, d2) = zmm_dest_bits(dest);
+				let (s11, s12) = zmm_src1_bits(src1);
+				let (s21, s22) = zmm_src2_bits(src2);
+				// vaddps zmmA, zmmB, zmmC
+				bytes.write(&[0x62, 0xf1 ^ d1 ^ s21, 0x7c ^ s11, 0x48 ^ s12, 0x58, 0xc0 ^ s22 ^ d2]);
+			}
+			_ => todo!()
+		}
+	}
+}
+
+fn try_main() -> Result<(), Box<dyn Error>> {
+	let arg = std::env::args().nth(1);
+	let filename = arg.unwrap_or("prospero.vm".into());
+	let text = std::fs::read_to_string(&filename)
+		.map_err(|e| format!("couldn't read prospero.vm: {e}"))?;
+	let _ops = read_ops(text)?;
 	const BIT_OFFSET: u32 = 2 + 4 * 3 + 4 + 2 * 4 + 2 * 3;
 	let width: u16 = 4096;
 	let height: u16 = 4096;
@@ -370,13 +469,28 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		thread_count >>= 1;
 	}
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
-	let code = unsafe { wrap_code(include_asm!("test")) }?;
+	let low_level_ops = vec![
+		LowLevelOp::StoreBuffer(123, 1),
+		LowLevelOp::LoadBuffer(12, 123),
+		LowLevelOp::StoreBuffer(456, 2),
+		LowLevelOp::LoadBuffer(13, 456),
+		LowLevelOp::Add(3, 12, Location::ZMM(13)),
+	];
+	let mut core = vec![0u8; low_level_ops.len() * 16];
+	let mut rest = &mut core[..];
+	for op in low_level_ops.iter().copied() {
+		op.to_bytes(&mut rest);
+	}
+	let rest_len = rest.len();
+	core.truncate(core.len() - rest_len);
+	let code = unsafe { wrap_code(&core) }?;
+	//let code = unsafe { wrap_code(include_asm!("test")) }?;
 	let mut x_strides = [0.0; 16];
 	for (i, x_stride) in x_strides.iter_mut().enumerate() {
 		*x_stride = -1.0 + i as f32 * 2.0 / f32::from(width);
 	}
 	let rows_per_thread = height / thread_count;
-	let x_strides = AVX512(x_strides);
+	let x_strides = ZMMValue(x_strides);
 	let info = Info {
 		code,
 		pixels,
@@ -384,6 +498,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		x_strides,
 		width,
 		height,
+		constants: vec![ZMMValue::default(); 8],//TODO
 	};
 	if thread_count == 1 {
 		unsafe { info.thread_main(0) };
