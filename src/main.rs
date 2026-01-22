@@ -60,7 +60,7 @@ impl PixelBuffer {
 	unsafe fn offset(self, by: usize) -> Self {
 		Self(unsafe { self.0.add(by) })
 	}
-	unsafe fn ptr(self) -> *mut u8 {
+	fn ptr(self) -> *mut u8 {
 		self.0
 	}
 }
@@ -177,6 +177,58 @@ impl ZmmValue {
 	fn constant(value: f32) -> Self {
 		Self([value; 16])
 	}
+	fn map(self, func: impl Fn(usize, f32) -> f32) -> Self {
+		let mut i = 0;
+		Self(self.0.map(|x| {
+			let value = func(i, x);
+			i += 1;
+			value
+		}))
+	}
+	fn min(self, other: Self) -> Self {
+		self.map(|i, x| x.min(other[i]))
+	}
+	fn max(self, other: Self) -> Self {
+		self.map(|i, x| x.max(other[i]))
+	}
+	fn sqrt(self) -> Self {
+		self.map(|_, x| x.sqrt())
+	}
+}
+
+impl std::ops::Neg for ZmmValue {
+	type Output = Self;
+	fn neg(self) -> Self::Output {
+		self.map(|_, x| -x)
+	}
+}
+
+impl std::ops::Index<usize> for ZmmValue {
+	type Output = f32;
+	fn index(&self, index: usize) -> &Self::Output {
+		&self.0[index]
+	}
+}
+
+impl std::ops::Add for ZmmValue {
+	type Output = ZmmValue;
+	fn add(self, rhs: Self) -> Self::Output {
+		self.map(|i, x| x + rhs[i])
+	}
+}
+
+impl std::ops::Sub for ZmmValue {
+	type Output = ZmmValue;
+	fn sub(self, rhs: Self) -> Self::Output {
+		self.map(|i, x| x - rhs[i])
+	}
+}
+
+impl std::ops::Mul for ZmmValue {
+	type Output = ZmmValue;
+	fn mul(self, rhs: Self) -> Self::Output {
+		self.map(|i, x| x * rhs[i])
+	}
 }
 
 enum Value {
@@ -250,11 +302,54 @@ struct Info {
 	width: u16,
 	height: u16,
 	constants: Vec<ZmmValue>,
+	instructions: Vec<Instruction>,
 	buffer_entries_needed: u32,
 }
 
 impl Info {
+	fn get_value(&self, zmm: &[ZmmValue; 32], buffer: &[ZmmValue], location: Location) -> ZmmValue {
+		match location {
+			Location::Constant(c) => self.constants[c as usize],
+			Location::Zmm(z) => zmm[z as usize],
+			Location::Buffer(b) => buffer[b as usize],
+		}
+	}
+	fn interpret(&self, instruction: Instruction, zmm: &mut [ZmmValue; 32], buffer: &mut [ZmmValue]) {
+		match instruction {
+			Instruction::Add(a, b, c) => {
+				zmm[a as usize] = zmm[b as usize] + self.get_value(zmm, buffer, c);
+			}
+			Instruction::Sub(a, b, c) => {
+				zmm[a as usize] = zmm[b as usize] - self.get_value(zmm, buffer, c);
+			}
+			Instruction::Mul(a, b, c) => {
+				zmm[a as usize] = zmm[b as usize] * self.get_value(zmm, buffer, c);
+			}
+			Instruction::Min(a, b, c) => {
+				zmm[a as usize] = zmm[b as usize].min(self.get_value(zmm, buffer, c));
+			}
+			Instruction::Max(a, b, c) => {
+				zmm[a as usize] = zmm[b as usize].max(self.get_value(zmm, buffer, c));
+			}
+			Instruction::Sqrt(a, b) => {
+				zmm[a as usize] = self.get_value(zmm, buffer, b).sqrt();
+			}
+			Instruction::LoadBuffer(z, b) => {
+				zmm[z as usize] = buffer[b as usize];
+			}
+			Instruction::StoreBuffer(b, z) => {
+				buffer[b as usize] = zmm[z as usize];
+			}
+			Instruction::Negate(a, b) => {
+				zmm[a as usize] = -zmm[b as usize];
+			}
+			Instruction::LoadConstant(a, b) => {
+				zmm[a as usize] = self.constants[b as usize];
+			}
+		}
+	}
 	unsafe fn thread_main(&self, thread_idx: u16) {
+		let interpreted = true; // for testing purposes
 		let base_y = self.rows_per_thread * thread_idx;
 		let inv_width2 = 2.0 / f32::from(self.width);
 		let inv_height2 = 2.0 / f32::from(self.height);
@@ -266,17 +361,38 @@ impl Info {
 		let constants = &self.constants;
 		for y in base_y..base_y + self.rows_per_thread {
 			let pixel = unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
-			unsafe {
-				code.run(
-					pixel.ptr(),
-					width / 16,
-					x_strides,
-					16.0 * inv_width2,
-					y as f32 * inv_height2 - 1.0,
-					&mut buffer,
-					constants,
-				)
-			};
+			let y = y as f32 * inv_height2 - 1.0;
+			if interpreted {
+				let mut zmm = [ZmmValue::default(); 32];
+				let mut ptr = pixel.ptr();
+				for x_idx in 0..self.width {
+					let x = x_idx as f32 * inv_width2 - 1.0;
+					zmm[ZMM_X as usize] = ZmmValue::constant(x);
+					zmm[ZMM_Y as usize] = ZmmValue::constant(y);
+					for instruction in self.instructions.iter().copied() {
+						self.interpret(instruction, &mut zmm, &mut buffer);
+					}
+					let output = zmm[ZMM_OUTPUT as usize];
+					if output.0[0] < 0.0 {
+						unsafe { *ptr |= 1 << (7 - x_idx % 8) };
+					}
+					if x_idx % 8 == 7 {
+						ptr = unsafe { ptr.add(1) };
+					}
+				}
+			} else {
+				unsafe {
+					code.run(
+						pixel.ptr(),
+						width / 16,
+						x_strides,
+						16.0 * inv_width2,
+						y,
+						&mut buffer,
+						constants,
+					)
+				};
+			}
 		}
 	}
 }
@@ -845,6 +961,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 		width,
 		height,
 		constants,
+		instructions,
 		buffer_entries_needed,
 	};
 	if thread_count == 1 {
