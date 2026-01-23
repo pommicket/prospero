@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::process::ExitCode;
 use std::io::Write;
+use std::process::ExitCode;
 
 #[cfg(not(target_arch = "x86_64"))]
 fn _check_target() {
@@ -315,7 +315,12 @@ impl Info {
 			Location::Buffer(b) => buffer[b as usize],
 		}
 	}
-	fn interpret(&self, instruction: Instruction, zmm: &mut [ZmmValue; 32], buffer: &mut [ZmmValue]) {
+	fn interpret(
+		&self,
+		instruction: Instruction,
+		zmm: &mut [ZmmValue; 32],
+		buffer: &mut [ZmmValue],
+	) {
 		match instruction {
 			Instruction::Add(a, b, c) => {
 				zmm[a as usize] = zmm[b as usize] + self.get_value(zmm, buffer, c);
@@ -376,13 +381,17 @@ impl Info {
 					let output = zmm[ZMM_OUTPUT as usize];
 					for i in 0..8 {
 						if output.0[i] < 0.0 {
-							unsafe { *ptr |= 1 << (7-i); }
+							unsafe {
+								*ptr |= 1 << (7 - i);
+							}
 						}
 					}
 					ptr = unsafe { ptr.add(1) };
 					for i in 8..16 {
 						if output.0[i] < 0.0 {
-							unsafe { *ptr |= 1 << (15-i); }
+							unsafe {
+								*ptr |= 1 << (15 - i);
+							}
 						}
 					}
 					ptr = unsafe { ptr.add(1) };
@@ -406,7 +415,7 @@ impl Info {
 
 fn read_ops(text: String) -> Result<Vec<Op>, Box<dyn Error>> {
 	let mut ops = vec![];
-	let mut index = 0;
+	let mut index: u16 = 0;
 	let mut mapping = HashMap::new();
 	for line in text.split('\n') {
 		let line = line.trim_ascii();
@@ -659,7 +668,7 @@ fn print_disassembly(code: &[u8]) -> Result<(), Box<dyn Error>> {
 	let stdout = String::from_utf8_lossy(&output.stdout);
 	std::fs::write("disassembly.out", stdout.as_bytes())?;
 	//println!("{stdout}");
-	
+
 	Ok(())
 }
 fn print_instructions(instructions: &[Instruction]) -> Result<(), Box<dyn Error>> {
@@ -700,11 +709,39 @@ impl ConstantList {
 
 struct Compiler {
 	buffer_idx: u32,
+	op_idx: u16,
+	last_uses: Vec<u16>,
 	instructions: Vec<Instruction>,
 	locations: Vec<Location>,
+	zmm_users: [Option<u16>; 32],
 }
 
 impl Compiler {
+	fn allocate_zmm(&mut self) -> u8 {
+		for zmm in 4_u8..=31 {
+			let user = self.zmm_users[zmm as usize];
+			let Some(user) = user else {
+				self.zmm_users[zmm as usize] = Some(self.op_idx);
+				return zmm;
+			};
+			if self.last_uses[user as usize] < self.op_idx {
+				self.zmm_users[zmm as usize] = Some(self.op_idx);
+				return zmm;
+			}
+		}
+		let zmm = (4_u8..=31)
+			.min_by_key(|&x| self.zmm_users[x as usize].unwrap())
+			.unwrap();
+		// evict previous user
+		let prev_user = self.zmm_users[zmm as usize].unwrap();
+		let buffer_idx = self.buffer_idx;
+		self.buffer_idx += 1;
+		self.instructions
+			.push(Instruction::StoreBuffer(buffer_idx, zmm));
+		self.locations[prev_user as usize] = Location::Buffer(buffer_idx);
+		self.zmm_users[zmm as usize] = Some(self.op_idx);
+		zmm
+	}
 	#[must_use]
 	fn compile_binop_with_constant(
 		&mut self,
@@ -712,18 +749,15 @@ impl Compiler {
 		arg: Location,
 		constant: u32,
 	) -> Location {
+		let dest = self.allocate_zmm();
 		let zmm = arg.load_zmm(&mut self.instructions);
 		constructor(
-			ZMM_SCRATCH,
+			dest,
 			zmm,
 			Location::Constant(constant),
 			&mut self.instructions,
 		);
-		let idx = self.buffer_idx;
-		self.buffer_idx += 1;
-		self.instructions
-			.push(Instruction::StoreBuffer(idx, ZMM_SCRATCH));
-		Location::Buffer(idx)
+		Location::Zmm(dest)
 	}
 	#[must_use]
 	fn compile_binop(
@@ -732,13 +766,10 @@ impl Compiler {
 		arg1: Location,
 		arg2: Location,
 	) -> Location {
+		let dest = self.allocate_zmm();
 		let zmm1 = arg1.load_zmm(&mut self.instructions);
-		let idx = self.buffer_idx;
-		self.buffer_idx += 1;
-		self.instructions.push(constructor(ZMM_SCRATCH, zmm1, arg2));
-		self.instructions
-			.push(Instruction::StoreBuffer(idx, ZMM_SCRATCH));
-		Location::Buffer(idx)
+		self.instructions.push(constructor(dest, zmm1, arg2));
+		Location::Zmm(dest)
 	}
 	#[must_use]
 	fn compile_unary(
@@ -746,24 +777,43 @@ impl Compiler {
 		constructor: impl FnOnce(u8, Location) -> Instruction,
 		arg: Location,
 	) -> Location {
-		self.instructions.push(constructor(ZMM_SCRATCH, arg));
-		let idx = self.buffer_idx;
-		self.buffer_idx += 1;
-		self.instructions
-			.push(Instruction::StoreBuffer(idx, ZMM_SCRATCH));
-		Location::Buffer(idx)
+		let dest = self.allocate_zmm();
+		self.instructions.push(constructor(dest, arg));
+		Location::Zmm(dest)
 	}
 }
 
 fn compile_down(ops: Vec<Op>) -> CompilationResult {
 	let mut constants = ConstantList::default();
 	constants.add(f32::from_bits(0x8000_0000));
+	let mut last_uses = vec![0u16; ops.len()];
+	for (i, op) in ops.iter().copied().enumerate() {
+		let i = i as u16;
+		let mut update = |arg: u16| last_uses[arg as usize] = last_uses[arg as usize].max(i);
+		match op {
+			Op::VarX | Op::VarY => {}
+			Op::Sqrt(x)
+			| Op::AddConst(x, _)
+			| Op::SubConst(x, _)
+			| Op::MulConst(x, _)
+			| Op::MinConst(x, _)
+			| Op::MaxConst(x, _) => update(x),
+			Op::Add(x, y) | Op::Sub(x, y) | Op::Mul(x, y) | Op::Min(x, y) | Op::Max(x, y) => {
+				update(x);
+				update(y);
+			}
+		}
+	}
 	let mut compiler = Compiler {
 		instructions: vec![],
 		locations: vec![],
 		buffer_idx: 0,
+		last_uses,
+		zmm_users: [None; 32],
+		op_idx: 0,
 	};
-	for op in ops.iter().copied() {
+	for (i, op) in ops.iter().copied().enumerate() {
+		compiler.op_idx = i as u16;
 		let location = match op {
 			Op::VarX => Location::Zmm(ZMM_X),
 			Op::VarY => Location::Zmm(ZMM_Y),
@@ -859,6 +909,7 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 		mut instructions,
 		locations,
 		buffer_idx,
+		..
 	} = compiler;
 	match *locations.last().unwrap() {
 		Location::Buffer(b) => {
