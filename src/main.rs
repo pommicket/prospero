@@ -8,7 +8,7 @@ fn _check_target() {
 	compile_error!("Only x86-64 target is supported.");
 }
 
-const SINGLE_THREADED: bool = true;
+const SINGLE_THREADED: bool = false;
 const ZMM_X: u8 = 2;
 const ZMM_Y: u8 = 1;
 const ZMM_SCRATCH: u8 = 3;
