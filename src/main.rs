@@ -181,8 +181,23 @@ fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
 	let epilogue = [0x0f, 0x8f, j0, j1, j2, j3, 0xc3];
 	unsafe { ptr.copy_from_nonoverlapping(epilogue.as_ptr(), epilogue.len()) };
 	let code_size = unsafe { ptr.offset_from(code) } as usize;
+	let mut cpuinfo: u64 = 0;
+	unsafe {
+		std::arch::asm!(
+			"push rbx\n
+			cpuid\n
+			mov {out}, rbx
+			pop rbx",
+			in("eax") 1,
+			out = out(reg) cpuinfo,
+			lateout("eax") _,
+			out("ecx") _,
+			out("edx") _,
+		);
+	};
+	let cache_line_size = 8 * ((cpuinfo >> 8) & 0xff) as usize;
 	// flush cache lines containing code to ensure it makes it out of the d-cache.
-	for i in 0..code_size / 64 {
+	for i in 0..code_size / cache_line_size {
 		unsafe {
 			std::arch::asm!(
 				"clflushopt [{x}]",
