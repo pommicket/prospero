@@ -29,7 +29,17 @@ def register_binary(name: str) -> None:
 	os.chmod(out_path, 0o755)
 	print(name + ' registered.')
 
-def compare_binaries(name1: str, name2: str) -> None:
+def compare_binaries(short_name1: str, short_name2: str) -> None:
+	names = os.listdir('benchmarks')
+	names1 = [name for name in names if name.startswith(short_name1)]
+	names2 = [name for name in names if name.startswith(short_name2)]
+	if len(names1) > 1:
+		print(short_name1, 'is ambiguous. Could be any of:', names1)
+	if len(names2) > 1:
+		print(short_name2, 'is ambiguous. Could be any of:', names2)
+	[name1] = names1
+	[name2] = names2
+	print('Comparing', name1, 'vs', name2, '...')
 	whiches = [False for i in range(trials)] + [True for i in range(trials)]
 	random.shuffle(whiches)
 	results = [[], []]
