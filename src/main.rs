@@ -367,7 +367,7 @@ impl Info {
 		let constants = &self.constants;
 		loop {
 			let y = self.next_row.fetch_add(1, Ordering::Relaxed);
-			if y > u32::from(self.height) {
+			if y >= u32::from(self.height) {
 				break;
 			}
 			let pixel = unsafe { pixels.offset(y as usize * usize::from(width) / 8) };
