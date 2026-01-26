@@ -533,6 +533,23 @@ enum Instruction {
 	Negate(u8, u8),
 }
 
+impl Instruction {
+	fn output_register(&mut self) -> Option<&mut u8> {
+		match self {
+			Self::LoadBuffer(x, _) => Some(x),
+			Self::LoadConstant(x, _) => Some(x),
+			Self::StoreBuffer(..) => None,
+			Self::Add(x, ..) => Some(x),
+			Self::Sub(x, ..) => Some(x),
+			Self::Mul(x, ..) => Some(x),
+			Self::Min(x, ..) => Some(x),
+			Self::Max(x, ..) => Some(x),
+			Self::Negate(x, ..) => Some(x),
+			Self::Sqrt(x, ..) => Some(x),
+		}
+	}
+}
+
 fn zmm_dest_bits(r: u8) -> (u8, u8) {
 	let bit4 = r >> 4;
 	let bit3 = (r >> 3) & 1;
@@ -931,7 +948,16 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 			instructions.push(Instruction::LoadConstant(ZMM_OUTPUT, c));
 		}
 		Location::Zmm(z) => {
-			if z != ZMM_OUTPUT {
+			if let Some(output) = instructions.last_mut()
+				.and_then(|i| i.output_register())
+				.filter(|x| **x == z) {
+				// fix up output register of last instruction
+				*output = ZMM_OUTPUT;
+			} else {
+				// otherwise,
+				// (weird case, only happens with extraneous instructions
+				//  or result = var-x or something)
+				// do this suboptimal register transfer
 				instructions.push(Instruction::StoreBuffer(0, z));
 				instructions.push(Instruction::LoadBuffer(ZMM_OUTPUT, 0));
 			}
