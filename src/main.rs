@@ -14,6 +14,8 @@ const ZMM_X: u8 = 2;
 const ZMM_Y: u8 = 1;
 const ZMM_SCRATCH: u8 = 3;
 const ZMM_OUTPUT: u8 = 3;
+// first zmm register free to use for storage
+const ZMM_FREE: u8 = 4;
 
 macro_rules! include_asm {
 	($name:literal) => {
@@ -21,6 +23,7 @@ macro_rules! include_asm {
 	};
 }
 
+/// High-level operation
 #[derive(Copy, Clone, Debug)]
 enum Op {
 	VarX,
@@ -33,16 +36,21 @@ enum Op {
 	Min(u16, u16),
 	MulConst(u16, f32),
 	AddConst(u16, f32),
+	/// Subtract variable from constant
+	///
+	/// (for subtracting constant from variable, can just use AddConst with negative constant)
 	SubConst(u16, f32),
 	MaxConst(u16, f32),
 	MinConst(u16, f32),
 }
 
+/// Parse .vm variable, e.g. `_f3c`
 fn parse_var(var: &str) -> u16 {
 	debug_assert!(var.starts_with('_'));
-	u16::from_str_radix(&var[1..], 16).unwrap()
+	u16::from_str_radix(&var[1..], 16).expect("bad variable")
 }
 
+/// Optimal # of threads to use
 fn available_parallelism() -> Option<u16> {
 	if SINGLE_THREADED {
 		return Some(1);
@@ -55,13 +63,21 @@ fn available_parallelism() -> Option<u16> {
 	Some(result.min(16384))
 }
 
+/// Buffer to hold the bitmap.
+///
+/// Essentially only exists so we can implement `Send` and `Sync` for it
 #[derive(Copy, Clone)]
 struct PixelBuffer(*mut u8);
 impl PixelBuffer {
+	/// Compute offsetted pixel buffer by certain number of bytes
+	///
+	/// # Safety
+	/// `by` must be `<=` the size of the buffer in bytes.
 	#[must_use]
 	unsafe fn offset(self, by: usize) -> Self {
 		Self(unsafe { self.0.add(by) })
 	}
+	/// Get pointer to pixel data
 	fn ptr(self) -> *mut u8 {
 		self.0
 	}
@@ -69,11 +85,18 @@ impl PixelBuffer {
 unsafe impl Send for PixelBuffer {}
 unsafe impl Sync for PixelBuffer {}
 
+/// Holds pointer to JIT-created code.
+///
+/// Essentially only exists so we can implement `Send` and `Sync` for it
 #[derive(Copy, Clone)]
 struct Code(*mut u8);
 unsafe impl Send for Code {}
 unsafe impl Sync for Code {}
 impl Code {
+	/// Run the code. See `asm/base.asm` for more details about the parameters.
+	///
+	/// # Safety
+	/// Code pointer must point to valid code, given the parameters.
 	#[allow(clippy::too_many_arguments)]
 	unsafe fn run(
 		self,
@@ -112,12 +135,14 @@ impl Code {
 	}
 }
 
-unsafe fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
+/// Wrap raw machine code with proper prologue and epilogue,
+/// and map it to executable memory.
+fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
 	let base_template = include_asm!("base");
 	let marker_idx = base_template
 		.windows(16)
 		.position(|win| win == [0xcc; 16])
-		.expect("bad ASM");
+		.ok_or("bad ASM - no marker")?;
 	let base_template_prefix = &base_template[..marker_idx];
 	let base_template_suffix = &base_template[marker_idx + 16..];
 	let map_size = (base_template.len() + core.len() + 128).next_multiple_of(4096);
@@ -152,9 +177,11 @@ unsafe fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
 	let ptr = unsafe { ptr.add(base_template_suffix.len()) };
 	let jump_offset = -((core.len() + base_template_suffix.len() + 6) as i32);
 	let [j0, j1, j2, j3] = jump_offset.to_le_bytes();
+	// create jump at bottom of pixel loop with proper offset
 	let epilogue = [0x0f, 0x8f, j0, j1, j2, j3, 0xc3];
 	unsafe { ptr.copy_from_nonoverlapping(epilogue.as_ptr(), epilogue.len()) };
 	let code_size = unsafe { ptr.offset_from(code) } as usize;
+	// flush cache lines containing code to ensure it makes it out of the d-cache.
 	for i in 0..code_size / 64 {
 		unsafe {
 			std::arch::asm!(
@@ -747,7 +774,7 @@ impl Compiler {
 		self.next_use_from(self.op_idx, op)
 	}
 	fn allocate_zmm(&mut self) -> u8 {
-		for zmm in 4_u8..=31 {
+		for zmm in ZMM_FREE..=31 {
 			let user = self.zmm_users[zmm as usize];
 			let Some(user) = user else {
 				self.zmm_users[zmm as usize] = Some(self.op_idx);
@@ -758,7 +785,7 @@ impl Compiler {
 				return zmm;
 			}
 		}
-		let zmm = (4_u8..=31)
+		let zmm = (ZMM_FREE..=31)
 			.max_by_key(|&x| self.next_use(self.zmm_users[x as usize].unwrap()))
 			.unwrap();
 		// evict previous user
@@ -948,9 +975,11 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 			instructions.push(Instruction::LoadConstant(ZMM_OUTPUT, c));
 		}
 		Location::Zmm(z) => {
-			if let Some(output) = instructions.last_mut()
+			if let Some(output) = instructions
+				.last_mut()
 				.and_then(|i| i.output_register())
-				.filter(|x| **x == z) {
+				.filter(|x| **x == z)
+			{
 				// fix up output register of last instruction
 				*output = ZMM_OUTPUT;
 			} else {
@@ -1052,8 +1081,8 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	if cfg!(debug_assertions) {
 		print_disassembly(&core)?;
 	}
-	let code = unsafe { wrap_code(&core) }?;
-	//let code = unsafe { wrap_code(include_asm!("test")) }?;
+	let code = wrap_code(&core)?;
+	//let code = wrap_code(include_asm!("test"))?;
 	let mut x_strides = [0.0; 16];
 	for (i, x_stride) in x_strides.iter_mut().enumerate() {
 		*x_stride = -1.0 + i as f32 * 2.0 / f32::from(width);

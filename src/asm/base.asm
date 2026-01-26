@@ -1,8 +1,9 @@
 ; do_row(
 ;     rdi = ptr to output data
-;     rsi = count (pixels / 16)
+;     rsi = number of groups of 16 pixels (width of image / 16)
 ;     rdx = ptr to [-1, -1+x_stride, -1+2*x_stride, .., -1+16*x_stride]
-;     rcx = ptr to buffer
+;           where x_stride = 2.0 / image_width
+;     rcx = ptr to buffer to hold variables
 ;     r8 = ptr to constants
 ;     xmm0 = 16*x_stride
 ;     xmm1 = y position
