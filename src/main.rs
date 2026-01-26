@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::io::Write;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(not(target_arch = "x86_64"))]
 fn _check_target() {
@@ -298,13 +299,13 @@ impl Value {
 struct Info {
 	code: Code,
 	pixels: PixelBuffer,
-	rows_per_thread: u16,
 	x_strides: ZmmValue,
 	width: u16,
 	height: u16,
 	constants: Vec<f32>,
 	instructions: Vec<Instruction>,
 	buffer_entries_needed: u32,
+	next_row: AtomicU32,
 }
 
 impl Info {
@@ -354,9 +355,8 @@ impl Info {
 			}
 		}
 	}
-	unsafe fn thread_main(&self, thread_idx: u16) {
+	unsafe fn thread_main(&self, _thread_idx: u16) {
 		let interpreted = false; // for testing purposes
-		let base_y = self.rows_per_thread * thread_idx;
 		let inv_width2 = 2.0 / f32::from(self.width);
 		let inv_height2 = 2.0 / f32::from(self.height);
 		let pixels = self.pixels;
@@ -365,9 +365,12 @@ impl Info {
 		let x_strides = &self.x_strides;
 		let mut buffer = vec![ZmmValue::default(); self.buffer_entries_needed as usize];
 		let constants = &self.constants;
-		let end_y = (base_y + self.rows_per_thread).min(self.height);
-		for y in base_y..end_y {
-			let pixel = unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
+		loop {
+			let y = self.next_row.fetch_add(1, Ordering::Relaxed);
+			if y > u32::from(self.height) {
+				break;
+			}
+			let pixel = unsafe { pixels.offset(y as usize * usize::from(width) / 8) };
 			let y = y as f32 * inv_height2 - 1.0;
 			if interpreted {
 				let mut zmm = [ZmmValue::default(); 32];
@@ -1029,18 +1032,17 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	for (i, x_stride) in x_strides.iter_mut().enumerate() {
 		*x_stride = -1.0 + i as f32 * 2.0 / f32::from(width);
 	}
-	let rows_per_thread = height / thread_count;
 	let x_strides = ZmmValue(x_strides);
 	let info = Info {
 		code,
 		pixels,
-		rows_per_thread,
 		x_strides,
 		width,
 		height,
 		constants,
 		instructions,
 		buffer_entries_needed,
+		next_row: AtomicU32::new(0),
 	};
 	if thread_count == 1 {
 		unsafe { info.thread_main(0) };

@@ -36,10 +36,11 @@ def compare_binaries(name1: str, name2: str) -> None:
 	for i,which in enumerate(whiches):
 		if i % 20 == 0:
 			print(i,'/',trials*2)
-		path = 'benchmarks/' + [name1, name2][int(which)]
+		name = [name1, name2][int(which)]
+		path = 'benchmarks/' + name
 		start_time = time.time()
 		if os.system(path):
-			print('Program ' + which + 'failed. Aborting.')
+			print(f'Program {name} failed. Aborting.')
 			exit()
 		end_time = time.time()
 		results[int(which)].append(end_time - start_time)
