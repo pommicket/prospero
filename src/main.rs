@@ -1004,9 +1004,8 @@ impl Compiler {
 	}
 }
 
-fn compile_down(ops: Vec<Op>) -> CompilationResult {
-	let mut constants = ConstantList::default();
-	constants.add(f32::from_bits(0x8000_0000));
+// uses[i] = list of ops which use the value of op #i
+fn get_uses(ops: &[Op]) -> Vec<Vec<u16>> {
 	let mut uses = vec![vec![]; ops.len()];
 	for (i, op) in ops.iter().copied().enumerate() {
 		let i = i as u16;
@@ -1025,6 +1024,13 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 			}
 		}
 	}
+	uses
+}
+
+fn compile_down(ops: Vec<Op>) -> CompilationResult {
+	let mut constants = ConstantList::default();
+	constants.add(f32::from_bits(0x8000_0000));
+	let uses = get_uses(&ops);
 	let mut compiler = Compiler {
 		instructions: vec![],
 		locations: vec![],
