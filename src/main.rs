@@ -365,7 +365,8 @@ impl Info {
 		let x_strides = &self.x_strides;
 		let mut buffer = vec![ZmmValue::default(); self.buffer_entries_needed as usize];
 		let constants = &self.constants;
-		for y in base_y..base_y + self.rows_per_thread {
+		let end_y = (base_y + self.rows_per_thread).min(self.height);
+		for y in base_y..end_y {
 			let pixel = unsafe { pixels.offset(usize::from(y) * usize::from(width) / 8) };
 			let y = y as f32 * inv_height2 - 1.0;
 			if interpreted {
@@ -1002,10 +1003,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	unsafe {
 		data.copy_from_nonoverlapping(header.as_ptr().cast(), header.len());
 	}
-	let mut thread_count = available_parallelism().unwrap_or(16).next_power_of_two();
-	while !height.is_multiple_of(thread_count) {
-		thread_count >>= 1;
-	}
+	let thread_count: u16 = available_parallelism().unwrap_or(16).min(height);
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
 	let CompilationResult {
 		instructions,
