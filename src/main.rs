@@ -858,18 +858,14 @@ impl Compiler {
 	#[must_use]
 	fn compile_binop_with_constant(
 		&mut self,
-		constructor: impl FnOnce(u8, u8, Location, &mut Vec<Instruction>),
+		constructor: impl FnOnce(u8, u8, Location) -> Instruction,
 		arg: Location,
 		constant: u32,
 	) -> Location {
 		let dest = self.allocate_zmm();
 		let zmm = arg.load_zmm(&mut self.instructions);
-		constructor(
-			dest,
-			zmm,
-			Location::Constant(constant),
-			&mut self.instructions,
-		);
+		self.instructions
+			.push(constructor(dest, zmm, Location::Constant(constant)));
 		Location::Zmm(dest)
 	}
 	#[must_use]
@@ -902,46 +898,22 @@ impl Compiler {
 			Op::Add(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
 				let arg = self.locations[arg as usize];
-				self.compile_binop_with_constant(
-					|d, s1, s2, instructions| {
-						instructions.push(Instruction::Add(d, s1, s2));
-					},
-					arg,
-					constant,
-				)
+				self.compile_binop_with_constant(Instruction::Add, arg, constant)
 			}
 			Op::Mul(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
 				let arg = self.locations[arg as usize];
-				self.compile_binop_with_constant(
-					|d, s1, s2, instructions| {
-						instructions.push(Instruction::Mul(d, s1, s2));
-					},
-					arg,
-					constant,
-				)
+				self.compile_binop_with_constant(Instruction::Mul, arg, constant)
 			}
 			Op::Min(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
 				let arg = self.locations[arg as usize];
-				self.compile_binop_with_constant(
-					|d, s1, s2, instructions| {
-						instructions.push(Instruction::Min(d, s1, s2));
-					},
-					arg,
-					constant,
-				)
+				self.compile_binop_with_constant(Instruction::Min, arg, constant)
 			}
 			Op::Max(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
 				let arg = self.locations[arg as usize];
-				self.compile_binop_with_constant(
-					|d, s1, s2, instructions| {
-						instructions.push(Instruction::Max(d, s1, s2));
-					},
-					arg,
-					constant,
-				)
+				self.compile_binop_with_constant(Instruction::Max, arg, constant)
 			}
 			Op::CSub(constant, arg) => {
 				if constant == 0.0 {
