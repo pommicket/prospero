@@ -809,6 +809,7 @@ struct Compiler {
 	locations: Vec<Location>,
 	zmm_users: [Option<u16>; 32],
 	buffer_users: BinaryHeap<BufferUser>,
+	constants: ConstantList,
 }
 
 impl Compiler {
@@ -902,6 +903,105 @@ impl Compiler {
 		self.instructions.push(constructor(dest, arg));
 		Location::Zmm(dest)
 	}
+
+	fn compile_op(&mut self, op: Op) -> Location {
+		match op {
+			Op::VarX => Location::Zmm(ZMM_X),
+			Op::VarY => Location::Zmm(ZMM_Y),
+			Op::AddConst(arg, constant) => {
+				let constant = self.constants.add(constant);
+				let arg = self.locations[arg as usize];
+				self.compile_binop_with_constant(
+					|d, s1, s2, instructions| {
+						instructions.push(Instruction::Add(d, s1, s2));
+					},
+					arg,
+					constant,
+				)
+			}
+			Op::MulConst(arg, constant) => {
+				let constant = self.constants.add(constant);
+				let arg = self.locations[arg as usize];
+				self.compile_binop_with_constant(
+					|d, s1, s2, instructions| {
+						instructions.push(Instruction::Mul(d, s1, s2));
+					},
+					arg,
+					constant,
+				)
+			}
+			Op::MinConst(arg, constant) => {
+				let constant = self.constants.add(constant);
+				let arg = self.locations[arg as usize];
+				self.compile_binop_with_constant(
+					|d, s1, s2, instructions| {
+						instructions.push(Instruction::Min(d, s1, s2));
+					},
+					arg,
+					constant,
+				)
+			}
+			Op::MaxConst(arg, constant) => {
+				let constant = self.constants.add(constant);
+				let arg = self.locations[arg as usize];
+				self.compile_binop_with_constant(
+					|d, s1, s2, instructions| {
+						instructions.push(Instruction::Max(d, s1, s2));
+					},
+					arg,
+					constant,
+				)
+			}
+			Op::SubConst(arg, constant) => {
+				if constant == 0.0 {
+					// special case: negate
+					let arg = self.locations[arg as usize];
+					let dest = self.allocate_zmm();
+					let arg = arg.load_zmm(&mut self.instructions);
+					self.instructions.push(Instruction::Negate(dest, arg));
+					Location::Zmm(dest)
+				} else {
+					let constant = self.constants.add(constant);
+					let arg = self.locations[arg as usize];
+					let dest = self.allocate_zmm();
+					self.instructions
+						.push(Instruction::LoadConstant(ZMM_SCRATCH, constant));
+					self.instructions
+						.push(Instruction::Sub(dest, ZMM_SCRATCH, arg));
+					Location::Zmm(dest)
+				}
+			}
+			Op::Add(arg1, arg2) => {
+				let arg1 = self.locations[arg1 as usize];
+				let arg2 = self.locations[arg2 as usize];
+				self.compile_binop(Instruction::Add, arg1, arg2)
+			}
+			Op::Sub(arg1, arg2) => {
+				let arg1 = self.locations[arg1 as usize];
+				let arg2 = self.locations[arg2 as usize];
+				self.compile_binop(Instruction::Sub, arg1, arg2)
+			}
+			Op::Min(arg1, arg2) => {
+				let arg1 = self.locations[arg1 as usize];
+				let arg2 = self.locations[arg2 as usize];
+				self.compile_binop(Instruction::Min, arg1, arg2)
+			}
+			Op::Max(arg1, arg2) => {
+				let arg1 = self.locations[arg1 as usize];
+				let arg2 = self.locations[arg2 as usize];
+				self.compile_binop(Instruction::Max, arg1, arg2)
+			}
+			Op::Mul(arg1, arg2) => {
+				let arg1 = self.locations[arg1 as usize];
+				let arg2 = self.locations[arg2 as usize];
+				self.compile_binop(Instruction::Mul, arg1, arg2)
+			}
+			Op::Sqrt(arg) => {
+				let arg = self.locations[arg as usize];
+				self.compile_unary(Instruction::Sqrt, arg)
+			}
+		}
+	}
 }
 
 fn compile_down(ops: Vec<Op>) -> CompilationResult {
@@ -933,113 +1033,18 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 		zmm_users: [None; 32],
 		op_idx: 0,
 		buffer_users: Default::default(),
+		constants,
 	};
 	for (i, op) in ops.iter().copied().enumerate() {
 		compiler.op_idx = i as u16;
-		let location = match op {
-			Op::VarX => Location::Zmm(ZMM_X),
-			Op::VarY => Location::Zmm(ZMM_Y),
-			Op::AddConst(arg, constant) => {
-				let constant = constants.add(constant);
-				let arg = compiler.locations[arg as usize];
-				compiler.compile_binop_with_constant(
-					|d, s1, s2, instructions| {
-						instructions.push(Instruction::Add(d, s1, s2));
-					},
-					arg,
-					constant,
-				)
-			}
-			Op::MulConst(arg, constant) => {
-				let constant = constants.add(constant);
-				let arg = compiler.locations[arg as usize];
-				compiler.compile_binop_with_constant(
-					|d, s1, s2, instructions| {
-						instructions.push(Instruction::Mul(d, s1, s2));
-					},
-					arg,
-					constant,
-				)
-			}
-			Op::MinConst(arg, constant) => {
-				let constant = constants.add(constant);
-				let arg = compiler.locations[arg as usize];
-				compiler.compile_binop_with_constant(
-					|d, s1, s2, instructions| {
-						instructions.push(Instruction::Min(d, s1, s2));
-					},
-					arg,
-					constant,
-				)
-			}
-			Op::MaxConst(arg, constant) => {
-				let constant = constants.add(constant);
-				let arg = compiler.locations[arg as usize];
-				compiler.compile_binop_with_constant(
-					|d, s1, s2, instructions| {
-						instructions.push(Instruction::Max(d, s1, s2));
-					},
-					arg,
-					constant,
-				)
-			}
-			Op::SubConst(arg, constant) => {
-				if constant == 0.0 {
-					// special case: negate
-					let arg = compiler.locations[arg as usize];
-					let dest = compiler.allocate_zmm();
-					let arg = arg.load_zmm(&mut compiler.instructions);
-					compiler.instructions.push(Instruction::Negate(dest, arg));
-					Location::Zmm(dest)
-				} else {
-					let constant = constants.add(constant);
-					let arg = compiler.locations[arg as usize];
-					let dest = compiler.allocate_zmm();
-					compiler
-						.instructions
-						.push(Instruction::LoadConstant(ZMM_SCRATCH, constant));
-					compiler
-						.instructions
-						.push(Instruction::Sub(dest, ZMM_SCRATCH, arg));
-					Location::Zmm(dest)
-				}
-			}
-			Op::Add(arg1, arg2) => {
-				let arg1 = compiler.locations[arg1 as usize];
-				let arg2 = compiler.locations[arg2 as usize];
-				compiler.compile_binop(Instruction::Add, arg1, arg2)
-			}
-			Op::Sub(arg1, arg2) => {
-				let arg1 = compiler.locations[arg1 as usize];
-				let arg2 = compiler.locations[arg2 as usize];
-				compiler.compile_binop(Instruction::Sub, arg1, arg2)
-			}
-			Op::Min(arg1, arg2) => {
-				let arg1 = compiler.locations[arg1 as usize];
-				let arg2 = compiler.locations[arg2 as usize];
-				compiler.compile_binop(Instruction::Min, arg1, arg2)
-			}
-			Op::Max(arg1, arg2) => {
-				let arg1 = compiler.locations[arg1 as usize];
-				let arg2 = compiler.locations[arg2 as usize];
-				compiler.compile_binop(Instruction::Max, arg1, arg2)
-			}
-			Op::Mul(arg1, arg2) => {
-				let arg1 = compiler.locations[arg1 as usize];
-				let arg2 = compiler.locations[arg2 as usize];
-				compiler.compile_binop(Instruction::Mul, arg1, arg2)
-			}
-			Op::Sqrt(arg) => {
-				let arg = compiler.locations[arg as usize];
-				compiler.compile_unary(Instruction::Sqrt, arg)
-			}
-		};
+		let location = compiler.compile_op(op);
 		compiler.locations.push(location);
 	}
 	let Compiler {
 		mut instructions,
 		locations,
 		buffer_idx,
+		constants,
 		..
 	} = compiler;
 	match *locations.last().unwrap() {
