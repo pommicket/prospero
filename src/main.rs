@@ -569,7 +569,7 @@ fn binary_op_to_bytes(bytes: &mut impl ByteWriter, op: u8, dest: u8, src1: u8, s
 			let (d1, d2) = zmm_dest_bits(dest);
 			let (s11, s12) = zmm_src1_bits(src1);
 			let (s21, s22) = zmm_src2_bits(src2);
-			// vaddps zmmA, zmmB, zmmC
+			// vXps zmmA, zmmB, zmmC
 			bytes.write(&[
 				0x62,
 				0xf1 ^ d1 ^ s21,
@@ -582,15 +582,15 @@ fn binary_op_to_bytes(bytes: &mut impl ByteWriter, op: u8, dest: u8, src1: u8, s
 		Location::Buffer(src2) => {
 			let (d1, d2) = zmm_dest_bits(dest);
 			let (s11, s12) = zmm_src1_bits(src1);
-			// vaddps zmmA, zmmB, [rcx+offset]
+			// vXps zmmA, zmmB, [rcx+offset]
 			bytes.write(&[0x62, 0xf1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, op, 0x81 ^ d2]);
 			bytes.write_u32(src2 * 64);
 		}
 		Location::Constant(src2) => {
 			let (d1, d2) = zmm_dest_bits(dest);
 			let (s11, s12) = zmm_src1_bits(src1);
-			// vaddps zmmA, zmmB, [r8+offset]
-			bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, op, 0x80 ^ d2]);
+			// vXps zmmA, zmmB, dword bcst [r8+offset]
+			bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s11, 0x58 ^ s12, op, 0x80 ^ d2]);
 			bytes.write_u32(src2 * 64);
 		}
 	}
@@ -601,8 +601,8 @@ impl Instruction {
 		match self {
 			Self::LoadConstant(r, offset) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
-				// vmovaps zmmA, [r8+offset]
-				bytes.write(&[0x62, 0xd1 ^ mask1, 0x7c, 0x48, 0x28, 0x80 | mask2]);
+				// vbroadcastss zmmA, [r8+offset]
+				bytes.write(&[0x62, 0xd2 ^ mask1, 0x7d, 0x48, 0x18, 0x80 | mask2]);
 				bytes.write_u32(offset * 64);
 			}
 			Self::LoadBuffer(r, offset) => {
@@ -634,17 +634,14 @@ impl Instruction {
 				bytes.write(&[0x62, 0xf1 ^ d1, 0x7c, 0x48, 0x51, 0x81 ^ d2]);
 				bytes.write_u32(src * 64);
 			}
-			Self::Sqrt(dest, Location::Constant(src)) => {
-				let (d1, d2) = zmm_dest_bits(dest);
-				// vsqrtps zmmA, [r8+offset]
-				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c, 0x48, 0x51, 0x80 ^ d2]);
-				bytes.write_u32(src * 64);
+			Self::Sqrt(_, Location::Constant(_)) => {
+				panic!("shouldn't be taking the sqrt of a constant");
 			}
 			Self::Negate(dest, src) => {
-				// vxorps zmmA, zmmB, [r8]
+				// vxorps zmmA, zmmB, dword bcst [r8]
 				let (d1, d2) = zmm_dest_bits(dest);
 				let (s1, s2) = zmm_src1_bits(src);
-				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s1, 0x48 ^ s2, 0x57, d2]);
+				bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s1, 0x58 ^ s2, 0x57, d2]);
 			}
 		}
 	}
