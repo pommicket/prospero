@@ -23,25 +23,24 @@ macro_rules! include_asm {
 	};
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ValueId {
+	Var(u16),
+	Constant(f32),
+}
+
 /// High-level operation
 #[derive(Copy, Clone, Debug)]
 enum Op {
 	VarX,
 	VarY,
-	Mul(u16, u16),
-	Add(u16, u16),
+	Mul(u16, ValueId),
+	Add(u16, ValueId),
 	Sub(u16, u16),
+	CSub(f32, u16),
 	Sqrt(u16),
-	Max(u16, u16),
-	Min(u16, u16),
-	MulConst(u16, f32),
-	AddConst(u16, f32),
-	/// Subtract variable from constant
-	///
-	/// (for subtracting constant from variable, can just use AddConst with negative constant)
-	SubConst(u16, f32),
-	MaxConst(u16, f32),
-	MinConst(u16, f32),
+	Max(u16, ValueId),
+	Min(u16, ValueId),
 }
 
 /// Parse .vm variable, e.g. `_f3c`
@@ -280,51 +279,43 @@ enum Value {
 	Constant(f32),
 }
 
-#[derive(Clone, Copy)]
-enum ValueId {
-	Var(u16),
-	Constant(f32),
-}
-
 impl Value {
 	fn add(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
 			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a + b),
-			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Add(a, b)),
-			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::AddConst(a, b)),
-			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::AddConst(b, a)),
+			(ValueId::Var(a), b) => Value::Var(Op::Add(a, b)),
+			(a, ValueId::Var(b)) => Value::Var(Op::Add(b, a)),
 		}
 	}
 	fn sub(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
 			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a - b),
 			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Sub(a, b)),
-			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::AddConst(a, -b)),
-			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::SubConst(b, a)),
+			(ValueId::Var(a), ValueId::Constant(b)) => {
+				Value::Var(Op::Add(a, ValueId::Constant(-b)))
+			}
+			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::CSub(a, b)),
 		}
 	}
 	fn mul(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
 			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a * b),
-			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Mul(a, b)),
-			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::MulConst(a, b)),
-			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::MulConst(b, a)),
+			(ValueId::Var(a), b) => Value::Var(Op::Mul(a, b)),
+			(a, ValueId::Var(b)) => Value::Var(Op::Mul(b, a)),
 		}
 	}
 	fn min(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
 			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a.min(b)),
-			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Min(a, b)),
-			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::MinConst(a, b)),
-			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::MinConst(b, a)),
+			(ValueId::Var(a), b) => Value::Var(Op::Min(a, b)),
+			(a, ValueId::Var(b)) => Value::Var(Op::Min(b, a)),
 		}
 	}
 	fn max(a: ValueId, b: ValueId) -> Value {
 		match (a, b) {
 			(ValueId::Constant(a), ValueId::Constant(b)) => Value::Constant(a.max(b)),
-			(ValueId::Var(a), ValueId::Var(b)) => Value::Var(Op::Max(a, b)),
-			(ValueId::Var(a), ValueId::Constant(b)) => Value::Var(Op::MaxConst(a, b)),
-			(ValueId::Constant(a), ValueId::Var(b)) => Value::Var(Op::MaxConst(b, a)),
+			(ValueId::Var(a), b) => Value::Var(Op::Max(a, b)),
+			(a, ValueId::Var(b)) => Value::Var(Op::Max(b, a)),
 		}
 	}
 	fn sqrt(a: ValueId) -> Value {
@@ -908,7 +899,7 @@ impl Compiler {
 		match op {
 			Op::VarX => Location::Zmm(ZMM_X),
 			Op::VarY => Location::Zmm(ZMM_Y),
-			Op::AddConst(arg, constant) => {
+			Op::Add(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
 				let arg = self.locations[arg as usize];
 				self.compile_binop_with_constant(
@@ -919,7 +910,7 @@ impl Compiler {
 					constant,
 				)
 			}
-			Op::MulConst(arg, constant) => {
+			Op::Mul(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
 				let arg = self.locations[arg as usize];
 				self.compile_binop_with_constant(
@@ -930,7 +921,7 @@ impl Compiler {
 					constant,
 				)
 			}
-			Op::MinConst(arg, constant) => {
+			Op::Min(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
 				let arg = self.locations[arg as usize];
 				self.compile_binop_with_constant(
@@ -941,7 +932,7 @@ impl Compiler {
 					constant,
 				)
 			}
-			Op::MaxConst(arg, constant) => {
+			Op::Max(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
 				let arg = self.locations[arg as usize];
 				self.compile_binop_with_constant(
@@ -952,7 +943,7 @@ impl Compiler {
 					constant,
 				)
 			}
-			Op::SubConst(arg, constant) => {
+			Op::CSub(constant, arg) => {
 				if constant == 0.0 {
 					// special case: negate
 					let arg = self.locations[arg as usize];
@@ -971,7 +962,7 @@ impl Compiler {
 					Location::Zmm(dest)
 				}
 			}
-			Op::Add(arg1, arg2) => {
+			Op::Add(arg1, ValueId::Var(arg2)) => {
 				let arg1 = self.locations[arg1 as usize];
 				let arg2 = self.locations[arg2 as usize];
 				self.compile_binop(Instruction::Add, arg1, arg2)
@@ -981,17 +972,17 @@ impl Compiler {
 				let arg2 = self.locations[arg2 as usize];
 				self.compile_binop(Instruction::Sub, arg1, arg2)
 			}
-			Op::Min(arg1, arg2) => {
+			Op::Min(arg1, ValueId::Var(arg2)) => {
 				let arg1 = self.locations[arg1 as usize];
 				let arg2 = self.locations[arg2 as usize];
 				self.compile_binop(Instruction::Min, arg1, arg2)
 			}
-			Op::Max(arg1, arg2) => {
+			Op::Max(arg1, ValueId::Var(arg2)) => {
 				let arg1 = self.locations[arg1 as usize];
 				let arg2 = self.locations[arg2 as usize];
 				self.compile_binop(Instruction::Max, arg1, arg2)
 			}
-			Op::Mul(arg1, arg2) => {
+			Op::Mul(arg1, ValueId::Var(arg2)) => {
 				let arg1 = self.locations[arg1 as usize];
 				let arg2 = self.locations[arg2 as usize];
 				self.compile_binop(Instruction::Mul, arg1, arg2)
@@ -1012,15 +1003,16 @@ fn get_uses(ops: &[Op]) -> Vec<Vec<u16>> {
 		let mut update = |arg: u16| uses[arg as usize].push(i);
 		match op {
 			Op::VarX | Op::VarY => {}
-			Op::Sqrt(x)
-			| Op::AddConst(x, _)
-			| Op::SubConst(x, _)
-			| Op::MulConst(x, _)
-			| Op::MinConst(x, _)
-			| Op::MaxConst(x, _) => update(x),
-			Op::Add(x, y) | Op::Sub(x, y) | Op::Mul(x, y) | Op::Min(x, y) | Op::Max(x, y) => {
+			Op::Sqrt(x) | Op::CSub(_, x) => update(x),
+			Op::Sub(x, y) => {
 				update(x);
 				update(y);
+			}
+			Op::Add(x, y) | Op::Mul(x, y) | Op::Min(x, y) | Op::Max(x, y) => {
+				update(x);
+				if let ValueId::Var(y) = y {
+					update(y);
+				}
 			}
 		}
 	}
