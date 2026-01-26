@@ -54,6 +54,7 @@ if verb in ['help', '-h', '--help']:
 	print_usage_and_exit()
 if verb == 'register':
 	if len(sys.argv) != 3: print_usage_and_exit()
+	os.system('cargo b --release')
 	register_binary(sys.argv[2])
 elif verb == 'compare':
 	if len(sys.argv) != 4: print_usage_and_exit()

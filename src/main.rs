@@ -82,7 +82,7 @@ impl Code {
 		stride16: f32,
 		y_pos: f32,
 		buffer: &mut [ZmmValue],
-		constants: &[ZmmValue],
+		constants: &[f32],
 	) {
 		let function: unsafe extern "sysv64" fn(
 			*mut u8,
@@ -91,7 +91,7 @@ impl Code {
 			f32,
 			f32,
 			*mut ZmmValue,
-			*const ZmmValue,
+			*const f32,
 		) = unsafe { std::mem::transmute(self.0) };
 		let count: u64 = count.into();
 		let x_strides: *const f32 = x_strides.as_ptr();
@@ -302,7 +302,7 @@ struct Info {
 	x_strides: ZmmValue,
 	width: u16,
 	height: u16,
-	constants: Vec<ZmmValue>,
+	constants: Vec<f32>,
 	instructions: Vec<Instruction>,
 	buffer_entries_needed: u32,
 }
@@ -310,7 +310,7 @@ struct Info {
 impl Info {
 	fn get_value(&self, zmm: &[ZmmValue; 32], buffer: &[ZmmValue], location: Location) -> ZmmValue {
 		match location {
-			Location::Constant(c) => self.constants[c as usize],
+			Location::Constant(c) => ZmmValue::constant(self.constants[c as usize]),
 			Location::Zmm(z) => zmm[z as usize],
 			Location::Buffer(b) => buffer[b as usize],
 		}
@@ -350,7 +350,7 @@ impl Info {
 				zmm[a as usize] = -zmm[b as usize];
 			}
 			Instruction::LoadConstant(a, b) => {
-				zmm[a as usize] = self.constants[b as usize];
+				zmm[a as usize] = ZmmValue::constant(self.constants[b as usize]);
 			}
 		}
 	}
@@ -591,7 +591,7 @@ fn binary_op_to_bytes(bytes: &mut impl ByteWriter, op: u8, dest: u8, src1: u8, s
 			let (s11, s12) = zmm_src1_bits(src1);
 			// vXps zmmA, zmmB, dword bcst [r8+offset]
 			bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s11, 0x58 ^ s12, op, 0x80 ^ d2]);
-			bytes.write_u32(src2 * 64);
+			bytes.write_u32(src2 * 4);
 		}
 	}
 }
@@ -603,7 +603,7 @@ impl Instruction {
 				let (mask1, mask2) = zmm_dest_bits(r);
 				// vbroadcastss zmmA, [r8+offset]
 				bytes.write(&[0x62, 0xd2 ^ mask1, 0x7d, 0x48, 0x18, 0x80 | mask2]);
-				bytes.write_u32(offset * 64);
+				bytes.write_u32(offset * 4);
 			}
 			Self::LoadBuffer(r, offset) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
@@ -679,26 +679,26 @@ fn print_instructions(instructions: &[Instruction]) -> Result<(), Box<dyn Error>
 }
 
 struct CompilationResult {
-	constants: Vec<ZmmValue>,
+	constants: Vec<f32>,
 	instructions: Vec<Instruction>,
 	buffer_entries_needed: u32,
 }
 
 #[derive(Default)]
 struct ConstantList {
-	array: Vec<ZmmValue>,
+	array: Vec<f32>,
 	map: HashMap<u32, u32>,
 }
 
 impl ConstantList {
 	fn add(&mut self, constant: f32) -> u32 {
-		// must ensure 64*constant_id is a valid immediate 32-bit offset
-		assert!(self.array.len() < (1 << 25));
+		// must ensure 4*constant_id is a valid immediate 32-bit offset
+		assert!(self.array.len() < (1 << 29));
 		if let Some(id) = self.map.get(&constant.to_bits()).copied() {
 			return id;
 		}
 		let id = self.array.len() as u32;
-		self.array.push(ZmmValue::constant(constant));
+		self.array.push(constant);
 		self.map.insert(constant.to_bits(), id);
 		id
 	}
