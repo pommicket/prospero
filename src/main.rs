@@ -975,16 +975,25 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 				)
 			}
 			Op::SubConst(arg, constant) => {
-				let constant = constants.add(constant);
-				let arg = compiler.locations[arg as usize];
-				compiler.compile_binop_with_constant(
-					|d, s1, s2, instructions| {
-						instructions.push(Instruction::Negate(d, s1));
-						instructions.push(Instruction::Add(d, d, s2));
-					},
-					arg,
-					constant,
-				)
+				if constant == 0.0 {
+					// special case: negate
+					let arg = compiler.locations[arg as usize];
+					let dest = compiler.allocate_zmm();
+					let arg = arg.load_zmm(&mut compiler.instructions);
+					compiler.instructions.push(Instruction::Negate(dest, arg));
+					Location::Zmm(dest)
+				} else {
+					let constant = constants.add(constant);
+					let arg = compiler.locations[arg as usize];
+					let dest = compiler.allocate_zmm();
+					compiler
+						.instructions
+						.push(Instruction::LoadConstant(ZMM_SCRATCH, constant));
+					compiler
+						.instructions
+						.push(Instruction::Sub(dest, ZMM_SCRATCH, arg));
+					Location::Zmm(dest)
+				}
 			}
 			Op::Add(arg1, arg2) => {
 				let arg1 = compiler.locations[arg1 as usize];
