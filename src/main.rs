@@ -928,7 +928,7 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 	CompilationResult {
 		constants: constants.array,
 		instructions,
-		buffer_entries_needed: buffer_idx,
+		buffer_entries_needed: buffer_idx.max(1),
 	}
 }
 
