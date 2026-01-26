@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::error::Error;
 use std::io::Write;
 use std::process::ExitCode;
@@ -767,6 +767,31 @@ impl ConstantList {
 	}
 }
 
+struct BufferUser {
+	last_use: u16,
+	buffer_idx: u32,
+}
+
+impl PartialEq for BufferUser {
+	fn eq(&self, other: &Self) -> bool {
+		matches!(self.cmp(other), std::cmp::Ordering::Equal)
+	}
+}
+
+impl Eq for BufferUser {}
+
+impl Ord for BufferUser {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		other.last_use.cmp(&self.last_use)
+	}
+}
+
+impl PartialOrd for BufferUser {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
 struct Compiler {
 	buffer_idx: u32,
 	op_idx: u16,
@@ -774,6 +799,7 @@ struct Compiler {
 	instructions: Vec<Instruction>,
 	locations: Vec<Location>,
 	zmm_users: [Option<u16>; 32],
+	buffer_users: BinaryHeap<BufferUser>,
 }
 
 impl Compiler {
@@ -805,8 +831,23 @@ impl Compiler {
 			.unwrap();
 		// evict previous user
 		let prev_user = self.zmm_users[zmm as usize].unwrap();
-		let buffer_idx = self.buffer_idx;
-		self.buffer_idx += 1;
+		let buffer_idx = if let Some(prev_buffer_user) = self.buffer_users.peek()
+			&& prev_buffer_user.last_use < self.op_idx
+		{
+			// use this old buffer slot instead of allocating a new one
+			let idx = prev_buffer_user.buffer_idx;
+			self.buffer_users.pop();
+			idx
+		} else {
+			let idx = self.buffer_idx;
+			self.buffer_idx += 1;
+			let last_use = self.last_use(prev_user);
+			self.buffer_users.push(BufferUser {
+				buffer_idx: idx,
+				last_use,
+			});
+			idx
+		};
 		self.instructions
 			.push(Instruction::StoreBuffer(buffer_idx, zmm));
 		self.locations[prev_user as usize] = Location::Buffer(buffer_idx);
@@ -882,6 +923,7 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 		uses,
 		zmm_users: [None; 32],
 		op_idx: 0,
+		buffer_users: Default::default(),
 	};
 	for (i, op) in ops.iter().copied().enumerate() {
 		compiler.op_idx = i as u16;
@@ -1085,6 +1127,8 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	} = compile_down(ops);
 	if cfg!(debug_assertions) {
 		print_instructions(&instructions)?;
+		println!("{}KB of buffer space needed", buffer_entries_needed / 16);
+		println!("{} instructions emitted", instructions.len());
 	}
 	let mut core = vec![0u8; instructions.len() * 16];
 	let mut rest = &mut core[..];
