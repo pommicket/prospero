@@ -738,7 +738,7 @@ impl Compiler {
 			}
 		}
 		let zmm = (4_u8..=31)
-			.min_by_key(|&x| self.next_use(self.zmm_users[x as usize].unwrap()))
+			.max_by_key(|&x| self.next_use(self.zmm_users[x as usize].unwrap()))
 			.unwrap();
 		// evict previous user
 		let prev_user = self.zmm_users[zmm as usize].unwrap();
