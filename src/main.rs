@@ -710,13 +710,24 @@ impl ConstantList {
 struct Compiler {
 	buffer_idx: u32,
 	op_idx: u16,
-	last_uses: Vec<u16>,
+	uses: Vec<Vec<u16>>,
 	instructions: Vec<Instruction>,
 	locations: Vec<Location>,
 	zmm_users: [Option<u16>; 32],
 }
 
 impl Compiler {
+	fn last_use(&self, op: u16) -> u16 {
+		self.uses[op as usize].last().copied().unwrap_or(0)
+	}
+	fn next_use_from(&self, from: u16, op: u16) -> u16 {
+		let uses = &self.uses[op as usize];
+		let next_use = uses.binary_search(&from).unwrap_or_else(|x| x);
+		uses[next_use]
+	}
+	fn next_use(&self, op: u16) -> u16 {
+		self.next_use_from(self.op_idx, op)
+	}
 	fn allocate_zmm(&mut self) -> u8 {
 		for zmm in 4_u8..=31 {
 			let user = self.zmm_users[zmm as usize];
@@ -724,13 +735,13 @@ impl Compiler {
 				self.zmm_users[zmm as usize] = Some(self.op_idx);
 				return zmm;
 			};
-			if self.last_uses[user as usize] < self.op_idx {
+			if self.last_use(user) < self.op_idx {
 				self.zmm_users[zmm as usize] = Some(self.op_idx);
 				return zmm;
 			}
 		}
 		let zmm = (4_u8..=31)
-			.min_by_key(|&x| self.zmm_users[x as usize].unwrap())
+			.min_by_key(|&x| self.next_use(self.zmm_users[x as usize].unwrap()))
 			.unwrap();
 		// evict previous user
 		let prev_user = self.zmm_users[zmm as usize].unwrap();
@@ -786,10 +797,10 @@ impl Compiler {
 fn compile_down(ops: Vec<Op>) -> CompilationResult {
 	let mut constants = ConstantList::default();
 	constants.add(f32::from_bits(0x8000_0000));
-	let mut last_uses = vec![0u16; ops.len()];
+	let mut uses = vec![vec![]; ops.len()];
 	for (i, op) in ops.iter().copied().enumerate() {
 		let i = i as u16;
-		let mut update = |arg: u16| last_uses[arg as usize] = last_uses[arg as usize].max(i);
+		let mut update = |arg: u16| uses[arg as usize].push(i);
 		match op {
 			Op::VarX | Op::VarY => {}
 			Op::Sqrt(x)
@@ -808,7 +819,7 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 		instructions: vec![],
 		locations: vec![],
 		buffer_idx: 0,
-		last_uses,
+		uses,
 		zmm_users: [None; 32],
 		op_idx: 0,
 	};
