@@ -646,15 +646,39 @@ fn binary_op_to_bytes(bytes: &mut impl ByteWriter, op: u8, dest: u8, src1: u8, s
 			let (d1, d2) = zmm_dest_bits(dest);
 			let (s11, s12) = zmm_src1_bits(src1);
 			// vXps zmmA, zmmB, [rcx+offset]
-			bytes.write(&[0x62, 0xf1 ^ d1, 0x7c ^ s11, 0x48 ^ s12, op, 0x81 ^ d2]);
-			bytes.write_u32(src2 * 64);
+			let offset_type = if src2 < 128 { 0x41 } else { 0x81 };
+			bytes.write(&[
+				0x62,
+				0xf1 ^ d1,
+				0x7c ^ s11,
+				0x48 ^ s12,
+				op,
+				offset_type ^ d2,
+			]);
+			if src2 < 128 {
+				bytes.write(&[src2 as u8]);
+			} else {
+				bytes.write_u32(src2 * 64);
+			}
 		}
 		Location::Constant(src2) => {
 			let (d1, d2) = zmm_dest_bits(dest);
 			let (s11, s12) = zmm_src1_bits(src1);
 			// vXps zmmA, zmmB, dword bcst [r8+offset]
-			bytes.write(&[0x62, 0xd1 ^ d1, 0x7c ^ s11, 0x58 ^ s12, op, 0x80 ^ d2]);
-			bytes.write_u32(src2 * 4);
+			let offset_type = if src2 < 128 { 0x40 } else { 0x80 };
+			bytes.write(&[
+				0x62,
+				0xd1 ^ d1,
+				0x7c ^ s11,
+				0x58 ^ s12,
+				op,
+				offset_type ^ d2,
+			]);
+			if src2 < 128 {
+				bytes.write(&[src2 as u8]);
+			} else {
+				bytes.write_u32(src2 * 4);
+			}
 		}
 	}
 }
@@ -665,20 +689,35 @@ impl Instruction {
 			Self::LoadConstant(r, offset) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
 				// vbroadcastss zmmA, [r8+offset]
-				bytes.write(&[0x62, 0xd2 ^ mask1, 0x7d, 0x48, 0x18, 0x80 | mask2]);
-				bytes.write_u32(offset * 4);
+				let offset_type = if offset < 128 { 0x40 } else { 0x80 };
+				bytes.write(&[0x62, 0xd2 ^ mask1, 0x7d, 0x48, 0x18, offset_type | mask2]);
+				if offset < 128 {
+					bytes.write(&[offset as u8]);
+				} else {
+					bytes.write_u32(offset * 4);
+				}
 			}
 			Self::LoadBuffer(r, offset) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
 				// vmovaps zmmA, [rcx+offset]
-				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x28, 0x81 | mask2]);
-				bytes.write_u32(offset * 64);
+				let offset_type = if offset < 128 { 0x41 } else { 0x81 };
+				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x28, offset_type | mask2]);
+				if offset < 128 {
+					bytes.write(&[offset as u8]);
+				} else {
+					bytes.write_u32(offset * 64);
+				}
 			}
 			Self::StoreBuffer(offset, r) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
+				let offset_type = if offset < 128 { 0x41 } else { 0x81 };
 				// vmovaps [rcx+offset], zmmA
-				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x29, 0x81 | mask2]);
-				bytes.write_u32(offset * 64);
+				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x29, offset_type | mask2]);
+				if offset < 128 {
+					bytes.write(&[offset as u8]);
+				} else {
+					bytes.write_u32(offset * 64);
+				}
 			}
 			Self::Add(dest, src1, src2) => binary_op_to_bytes(bytes, 0x58, dest, src1, src2),
 			Self::Sub(dest, src1, src2) => binary_op_to_bytes(bytes, 0x5c, dest, src1, src2),
@@ -694,8 +733,13 @@ impl Instruction {
 			Self::Sqrt(dest, Location::Buffer(src)) => {
 				let (d1, d2) = zmm_dest_bits(dest);
 				// vsqrtps zmmA, [rcx+offset]
-				bytes.write(&[0x62, 0xf1 ^ d1, 0x7c, 0x48, 0x51, 0x81 ^ d2]);
-				bytes.write_u32(src * 64);
+				let offset_type = if src < 128 { 0x41 } else { 0x81 };
+				bytes.write(&[0x62, 0xf1 ^ d1, 0x7c, 0x48, 0x51, offset_type ^ d2]);
+				if src < 128 {
+					bytes.write(&[src as u8]);
+				} else {
+					bytes.write_u32(src * 64);
+				}
 			}
 			Self::Sqrt(_, Location::Constant(_)) => {
 				panic!("shouldn't be taking the sqrt of a constant");
@@ -1137,7 +1181,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	if cfg!(debug_assertions) {
 		print_instructions(&instructions)?;
 		println!("{}KB of buffer space needed", buffer_entries_needed / 16);
-		println!("{} instructions emitted", instructions.len());
+		print!("{} instructions emitted ", instructions.len());
 	}
 	let mut core = vec![0u8; instructions.len() * 16];
 	let mut rest = &mut core[..];
@@ -1147,6 +1191,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	let rest_len = rest.len();
 	core.truncate(core.len() - rest_len);
 	if cfg!(debug_assertions) {
+		println!("({} bytes)", core.len());
 		print_disassembly(&core)?;
 	}
 	let code = wrap_code(&core)?;
