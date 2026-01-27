@@ -9,20 +9,27 @@ fn _check_target() {
 	compile_error!("Only x86-64 target is supported.");
 }
 
+/// run in single threaded mode? (for debugging)
 const SINGLE_THREADED: bool = false;
+/// zmm register holding x positions
 const ZMM_X: u8 = 2;
+/// zmm register holding y position
 const ZMM_Y: u8 = 1;
+/// scratch zmm register for intermediate results
 const ZMM_SCRATCH: u8 = 3;
+/// zmm register used to store output
 const ZMM_OUTPUT: u8 = 3;
-// first zmm register free to use for storage
+/// first zmm register free to use for storage
 const ZMM_FREE: u8 = 4;
 
+/// include bytes of binary assembled by build.rs from `src/$name.asm`
 macro_rules! include_asm {
 	($name:literal) => {
 		include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".out"))
 	};
 }
 
+/// Either a variable ([`Op`]) or a constant
 #[derive(Clone, Copy, Debug)]
 enum ValueId {
 	Var(u16),
@@ -43,7 +50,7 @@ enum Op {
 	Min(u16, ValueId),
 }
 
-/// Parse .vm variable, e.g. `_f3c`
+/// Parse .vm variable, e.g. `_f3c -> 0xf3c`
 fn parse_var(var: &str) -> u16 {
 	debug_assert!(var.starts_with('_'));
 	u16::from_str_radix(&var[1..], 16).expect("bad variable")
@@ -134,6 +141,25 @@ impl Code {
 	}
 }
 
+/// get size of a cache line on this system
+fn get_cache_line_size() -> usize {
+	let mut cpuinfo: u64 = 0;
+	unsafe {
+		std::arch::asm!(
+			"push rbx\n
+			cpuid\n
+			mov {out}, rbx
+			pop rbx",
+			in("eax") 1,
+			out = out(reg) cpuinfo,
+			lateout("eax") _,
+			out("ecx") _,
+			out("edx") _,
+		);
+	};
+	8 * ((cpuinfo >> 8) & 0xff) as usize
+}
+
 /// Wrap raw machine code with proper prologue and epilogue,
 /// and map it to executable memory.
 fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
@@ -162,41 +188,30 @@ fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
 		return Err("mmap failed".into());
 	}
 	let code: *mut u8 = code.cast();
+	// copy start of base template
 	unsafe {
 		code.copy_from_nonoverlapping(base_template_prefix.as_ptr(), base_template_prefix.len());
 	}
 	let ptr = unsafe { code.add(base_template_prefix.len()) };
+	// copy JIT-compiled code
 	unsafe {
 		ptr.copy_from_nonoverlapping(core.as_ptr(), core.len());
 	}
 	let ptr = unsafe { ptr.add(core.len()) };
+	// copy end of base template
 	unsafe {
 		ptr.copy_from_nonoverlapping(base_template_suffix.as_ptr(), base_template_suffix.len());
 	}
 	let ptr = unsafe { ptr.add(base_template_suffix.len()) };
 	let jump_offset = -((core.len() + base_template_suffix.len() + 6) as i32);
 	let [j0, j1, j2, j3] = jump_offset.to_le_bytes();
-	// create jump at bottom of pixel loop with proper offset
+	// create jump at bottom of pixel loop back to top with proper offset
 	let epilogue = [0x0f, 0x8f, j0, j1, j2, j3, 0xc3];
 	unsafe { ptr.copy_from_nonoverlapping(epilogue.as_ptr(), epilogue.len()) };
 	let code_size = unsafe { ptr.offset_from(code) } as usize;
-	let mut cpuinfo: u64 = 0;
-	unsafe {
-		std::arch::asm!(
-			"push rbx\n
-			cpuid\n
-			mov {out}, rbx
-			pop rbx",
-			in("eax") 1,
-			out = out(reg) cpuinfo,
-			lateout("eax") _,
-			out("ecx") _,
-			out("edx") _,
-		);
-	};
-	let cache_line_size = 8 * ((cpuinfo >> 8) & 0xff) as usize;
-	// flush cache lines containing code to ensure it makes it out of the d-cache.
-	for i in 0..code_size / cache_line_size {
+	// flush cache lines containing code to evict dirty d-cache entries.
+	// idk if this is actually necessary on x86-64, but might as well.
+	for i in 0..code_size / get_cache_line_size() {
 		unsafe {
 			std::arch::asm!(
 				"clflushopt [{x}]",
@@ -204,22 +219,28 @@ fn wrap_code(core: &[u8]) -> Result<Code, Box<dyn Error>> {
 			)
 		}
 	}
+	// make the memory executable
 	if unsafe { libc::mprotect(code.cast(), map_size, libc::PROT_EXEC) } != 0 {
 		return Err("mprotect failed".into());
 	}
 	Ok(Code(code))
 }
 
+/// Holds 16 floating-point numbers, with 512-bit alignment
 #[derive(Copy, Clone, Default)]
 #[repr(C, align(64))]
 struct ZmmValue([f32; 16]);
+
 impl ZmmValue {
+	/// Get pointer to the numbers
 	fn as_ptr(&self) -> *const f32 {
 		self.0.as_ptr()
 	}
+	/// Broadcast `value` to all 16 elements
 	fn constant(value: f32) -> Self {
 		Self([value; 16])
 	}
+	/// Apply a function to each element
 	fn map(self, func: impl Fn(usize, f32) -> f32) -> Self {
 		let mut i = 0;
 		Self(self.0.map(|x| {
@@ -228,12 +249,15 @@ impl ZmmValue {
 			value
 		}))
 	}
+	/// Component-wise minimum
 	fn min(self, other: Self) -> Self {
 		self.map(|i, x| x.min(other[i]))
 	}
+	/// Component-wise maximum
 	fn max(self, other: Self) -> Self {
 		self.map(|i, x| x.max(other[i]))
 	}
+	/// Component-wise square root
 	fn sqrt(self) -> Self {
 		self.map(|_, x| x.sqrt())
 	}
@@ -274,6 +298,7 @@ impl std::ops::Mul for ZmmValue {
 	}
 }
 
+/// Either an operation or a constant value
 enum Value {
 	Var(Op),
 	Constant(f32),
@@ -329,9 +354,11 @@ impl Value {
 	}
 }
 
+/// Info needed to execute JIT-compiled code
 struct Info {
 	code: Code,
 	pixels: PixelBuffer,
+	// see asm/base.asm
 	x_strides: ZmmValue,
 	width: u16,
 	height: u16,
@@ -342,6 +369,7 @@ struct Info {
 }
 
 impl Info {
+	/// Get value of a [`Location`].
 	fn get_value(&self, zmm: &[ZmmValue; 32], buffer: &[ZmmValue], location: Location) -> ZmmValue {
 		match location {
 			Location::Constant(c) => ZmmValue::constant(self.constants[c as usize]),
@@ -349,6 +377,7 @@ impl Info {
 			Location::Buffer(b) => buffer[b as usize],
 		}
 	}
+	/// Emulates an instruction (for testing purposes)
 	fn interpret(
 		&self,
 		instruction: Instruction,
@@ -386,7 +415,8 @@ impl Info {
 		}
 	}
 	unsafe fn thread_main(&self, _thread_idx: u16) {
-		let interpreted = false; // for testing purposes
+		// for testing purposes: interpret the instructions instead of running them
+		let interpreted = false;
 		let inv_width2 = 2.0 / f32::from(self.width);
 		let inv_height2 = 2.0 / f32::from(self.height);
 		let pixels = self.pixels;
@@ -447,6 +477,7 @@ impl Info {
 	}
 }
 
+/// Read operations from file contents
 fn read_ops(text: String) -> Result<Vec<Op>, Box<dyn Error>> {
 	let mut ops = vec![];
 	let mut index: u16 = 0;
@@ -561,15 +592,15 @@ enum Instruction {
 impl Instruction {
 	fn output_register(&mut self) -> Option<&mut u8> {
 		match self {
-			Self::Mov(x, _) => Some(x),
+			Self::Mov(x, ..)
+			| Self::Add(x, ..)
+			| Self::Sub(x, ..)
+			| Self::Mul(x, ..)
+			| Self::Min(x, ..)
+			| Self::Max(x, ..)
+			| Self::Negate(x, ..)
+			| Self::Sqrt(x, ..) => Some(x),
 			Self::StoreBuffer(..) => None,
-			Self::Add(x, ..) => Some(x),
-			Self::Sub(x, ..) => Some(x),
-			Self::Mul(x, ..) => Some(x),
-			Self::Min(x, ..) => Some(x),
-			Self::Max(x, ..) => Some(x),
-			Self::Negate(x, ..) => Some(x),
-			Self::Sqrt(x, ..) => Some(x),
 		}
 	}
 }
@@ -803,13 +834,10 @@ impl Compiler {
 	fn last_use(&self, op: u16) -> u16 {
 		self.uses[op as usize].last().copied().unwrap_or(0)
 	}
-	fn next_use_from(&self, from: u16, op: u16) -> u16 {
+	fn next_use_after(&self, after: u16, op: u16) -> u16 {
 		let uses = &self.uses[op as usize];
-		let next_use = uses.binary_search(&from).unwrap_or_else(|x| x);
+		let next_use = uses.binary_search(&after).unwrap_or_else(|x| x);
 		uses.get(next_use).copied().unwrap_or(u16::MAX)
-	}
-	fn next_use(&self, op: u16) -> u16 {
-		self.next_use_from(self.op_idx, op)
 	}
 
 	fn allocate_zmm_for(&mut self, whatfor: u16) -> u8 {
@@ -819,13 +847,15 @@ impl Compiler {
 				self.zmm_users[zmm as usize] = Some(whatfor);
 				return zmm;
 			};
-			if self.last_use(user) < whatfor {
+			if self.last_use(user) <= whatfor {
 				self.zmm_users[zmm as usize] = Some(whatfor);
 				return zmm;
 			}
 		}
 		let zmm = (ZMM_FREE..=31)
-			.max_by_key(|&x| self.next_use(self.zmm_users[x as usize].unwrap()))
+			.max_by_key(|&x| {
+				self.next_use_after(self.op_idx + 1, self.zmm_users[x as usize].unwrap())
+			})
 			.unwrap();
 
 		// evict previous user
@@ -860,11 +890,12 @@ impl Compiler {
 	fn compile_binop_with_constant(
 		&mut self,
 		constructor: impl FnOnce(u8, u8, Location) -> Instruction,
-		arg: Location,
+		argop: u16,
 		constant: u32,
 	) -> Location {
-		let dest = self.allocate_zmm();
+		let arg = self.locations[argop as usize];
 		let zmm = arg.load_zmm(&mut self.instructions);
+		let dest = self.allocate_zmm();
 		self.instructions
 			.push(constructor(dest, zmm, Location::Constant(constant)));
 		Location::Zmm(dest)
@@ -892,8 +923,9 @@ impl Compiler {
 	fn compile_unary(
 		&mut self,
 		constructor: impl FnOnce(u8, Location) -> Instruction,
-		arg: Location,
+		argop: u16,
 	) -> Location {
+		let arg = self.locations[argop as usize];
 		let dest = self.allocate_zmm();
 		self.instructions.push(constructor(dest, arg));
 		Location::Zmm(dest)
@@ -905,22 +937,18 @@ impl Compiler {
 			Op::VarY => Location::Zmm(ZMM_Y),
 			Op::Add(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
-				let arg = self.locations[arg as usize];
 				self.compile_binop_with_constant(Instruction::Add, arg, constant)
 			}
 			Op::Mul(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
-				let arg = self.locations[arg as usize];
 				self.compile_binop_with_constant(Instruction::Mul, arg, constant)
 			}
 			Op::Min(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
-				let arg = self.locations[arg as usize];
 				self.compile_binop_with_constant(Instruction::Min, arg, constant)
 			}
 			Op::Max(arg, ValueId::Constant(constant)) => {
 				let constant = self.constants.add(constant);
-				let arg = self.locations[arg as usize];
 				self.compile_binop_with_constant(Instruction::Max, arg, constant)
 			}
 			Op::CSub(constant, arg) => {
@@ -955,10 +983,7 @@ impl Compiler {
 			Op::Mul(arg1, ValueId::Var(arg2)) => {
 				self.compile_binop(true, Instruction::Mul, arg1, arg2)
 			}
-			Op::Sqrt(arg) => {
-				let arg = self.locations[arg as usize];
-				self.compile_unary(Instruction::Sqrt, arg)
-			}
+			Op::Sqrt(arg) => self.compile_unary(Instruction::Sqrt, arg),
 		}
 	}
 }
@@ -1032,19 +1057,29 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 	}
 }
 
+fn show_help() {
+	println!("Usage: prospero [vm file] [resolution]");
+}
+
 fn try_main() -> Result<(), Box<dyn Error>> {
 	// needed for vpmovd2m
 	if !is_x86_feature_detected!("avx512dq") {
 		return Err("Your CPU doesn't support AVX512DQ. Sorry ):".into());
 	}
-	let arg = std::env::args().nth(1);
-	let filename = arg.unwrap_or("prospero.vm".into());
-	let text = std::fs::read_to_string(&filename)
-		.map_err(|e| format!("couldn't read prospero.vm: {e}"))?;
-	let ops = read_ops(text)?;
+	let args: Vec<String> = std::env::args().skip(1).collect();
+	if args.iter().any(|x| x == "-h" || x == "--help") || args.len() > 2 {
+		show_help();
+		return Ok(());
+	}
+	let filename = args.first().map_or("prospero.vm", |s| s.as_ref());
+	let resolution: u16 = args.get(1).map_or(Ok(1024), |resolution| {
+		resolution
+			.parse()
+			.map_err(|e| format!("invalid number: {e}"))
+	})?;
 	const BIT_OFFSET: u32 = 2 + 4 * 3 + 4 + 2 * 4 + 2 * 3;
-	let width: u16 = 1024;
-	let height: u16 = 1024;
+	let width: u16 = resolution;
+	let height: u16 = resolution;
 	if !width.is_multiple_of(16) {
 		return Err(format!("width {width} should be a multiple of 16").into());
 	}
@@ -1096,6 +1131,9 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	}
 	let thread_count: u16 = available_parallelism().unwrap_or(16).min(height);
 	let pixels = PixelBuffer(unsafe { data.add(BIT_OFFSET as usize).cast() });
+	let text =
+		std::fs::read_to_string(filename).map_err(|e| format!("couldn't read prospero.vm: {e}"))?;
+	let ops = read_ops(text)?;
 	let CompilationResult {
 		instructions,
 		constants,
