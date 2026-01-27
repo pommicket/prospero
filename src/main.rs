@@ -374,17 +374,14 @@ impl Info {
 			Instruction::Sqrt(a, b) => {
 				zmm[a as usize] = self.get_value(zmm, buffer, b).sqrt();
 			}
-			Instruction::LoadBuffer(z, b) => {
-				zmm[z as usize] = buffer[b as usize];
+			Instruction::Mov(dest, src) => {
+				zmm[dest as usize] = self.get_value(zmm, buffer, src);
 			}
 			Instruction::StoreBuffer(b, z) => {
 				buffer[b as usize] = zmm[z as usize];
 			}
 			Instruction::Negate(a, b) => {
 				zmm[a as usize] = -zmm[b as usize];
-			}
-			Instruction::LoadConstant(a, b) => {
-				zmm[a as usize] = ZmmValue::constant(self.constants[b as usize]);
 			}
 		}
 	}
@@ -540,12 +537,8 @@ impl Location {
 	fn load_zmm(self, instructions: &mut Vec<Instruction>) -> u8 {
 		match self {
 			Self::Zmm(n) => n,
-			Self::Buffer(x) => {
-				instructions.push(Instruction::LoadBuffer(ZMM_SCRATCH, x));
-				ZMM_SCRATCH
-			}
-			Self::Constant(x) => {
-				instructions.push(Instruction::LoadConstant(ZMM_SCRATCH, x));
+			l => {
+				instructions.push(Instruction::Mov(ZMM_SCRATCH, l));
 				ZMM_SCRATCH
 			}
 		}
@@ -554,8 +547,7 @@ impl Location {
 
 #[derive(Clone, Copy, Debug)]
 enum Instruction {
-	LoadBuffer(u8, u32),
-	LoadConstant(u8, u32),
+	Mov(u8, Location),
 	StoreBuffer(u32, u8),
 	Add(u8, u8, Location),
 	Sub(u8, u8, Location),
@@ -569,8 +561,7 @@ enum Instruction {
 impl Instruction {
 	fn output_register(&mut self) -> Option<&mut u8> {
 		match self {
-			Self::LoadBuffer(x, _) => Some(x),
-			Self::LoadConstant(x, _) => Some(x),
+			Self::Mov(x, _) => Some(x),
 			Self::StoreBuffer(..) => None,
 			Self::Add(x, ..) => Some(x),
 			Self::Sub(x, ..) => Some(x),
@@ -662,13 +653,13 @@ fn binary_op_to_bytes(bytes: &mut impl ByteWriter, op: u8, dest: u8, src1: u8, s
 impl Instruction {
 	fn to_bytes(self, bytes: &mut impl ByteWriter) {
 		match self {
-			Self::LoadConstant(r, offset) => {
+			Self::Mov(r, Location::Constant(offset)) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
 				// vbroadcastss zmmA, [r8+offset]
 				bytes.write(&[0x62, 0xd2 ^ mask1, 0x7d, 0x48, 0x18]);
 				write_memory_operand(bytes, mask2, offset, 4);
 			}
-			Self::LoadBuffer(r, offset) => {
+			Self::Mov(r, Location::Buffer(offset)) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
 				// vmovaps zmmA, [rcx+offset]
 				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x28]);
@@ -815,15 +806,16 @@ impl Compiler {
 	fn next_use(&self, op: u16) -> u16 {
 		self.next_use_from(self.op_idx, op)
 	}
-	fn allocate_zmm(&mut self) -> u8 {
+	
+	fn allocate_zmm_for(&mut self, whatfor: u16) -> u8 {
 		for zmm in ZMM_FREE..=31 {
 			let user = self.zmm_users[zmm as usize];
 			let Some(user) = user else {
-				self.zmm_users[zmm as usize] = Some(self.op_idx);
+				self.zmm_users[zmm as usize] = Some(whatfor);
 				return zmm;
 			};
-			if self.last_use(user) < self.op_idx {
-				self.zmm_users[zmm as usize] = Some(self.op_idx);
+			if self.last_use(user) < whatfor {
+				self.zmm_users[zmm as usize] = Some(whatfor);
 				return zmm;
 			}
 		}
@@ -833,7 +825,7 @@ impl Compiler {
 		// evict previous user
 		let prev_user = self.zmm_users[zmm as usize].unwrap();
 		let buffer_idx = if let Some(prev_buffer_user) = self.buffer_users.peek()
-			&& prev_buffer_user.last_use < self.op_idx
+			&& prev_buffer_user.last_use < whatfor
 		{
 			// use this old buffer slot instead of allocating a new one
 			let idx = prev_buffer_user.buffer_idx;
@@ -852,8 +844,21 @@ impl Compiler {
 		self.instructions
 			.push(Instruction::StoreBuffer(buffer_idx, zmm));
 		self.locations[prev_user as usize] = Location::Buffer(buffer_idx);
-		self.zmm_users[zmm as usize] = Some(self.op_idx);
+		self.zmm_users[zmm as usize] = Some(whatfor);
 		zmm
+	}
+	fn allocate_zmm(&mut self) -> u8 {
+		self.allocate_zmm_for(self.op_idx)
+	}
+	fn load_var_to_zmm(&mut self, var: u16) -> u8 {
+		let location = self.locations[var as usize];
+		if let Location::Zmm(z) = location {
+			return z;
+		}
+		let dest = self.allocate_zmm_for(var);
+		self.instructions.push(Instruction::Mov(dest, location));
+		self.locations[var as usize] = Location::Zmm(dest);
+		dest
 	}
 	#[must_use]
 	fn compile_binop_with_constant(
