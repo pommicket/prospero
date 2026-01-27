@@ -665,6 +665,11 @@ impl Instruction {
 				bytes.write(&[0x62, 0xf1 ^ mask1, 0x7c, 0x48, 0x28]);
 				write_memory_operand(bytes, mask2 | 0x01, offset, 64);
 			}
+			Self::Mov(dest, Location::Zmm(src)) => {
+				let (d1, d2) = zmm_dest_bits(dest);
+				let (s1, s2) = zmm_src2_bits(src);
+				bytes.write(&[0x62, 0xf1 ^ d1 ^ s1, 0x7c, 0x48, 0x28, 0xc0 ^ d2 ^ s2]);
+			}
 			Self::StoreBuffer(offset, r) => {
 				let (mask1, mask2) = zmm_dest_bits(r);
 				// vmovaps [rcx+offset], zmmA
@@ -801,12 +806,12 @@ impl Compiler {
 	fn next_use_from(&self, from: u16, op: u16) -> u16 {
 		let uses = &self.uses[op as usize];
 		let next_use = uses.binary_search(&from).unwrap_or_else(|x| x);
-		uses[next_use]
+		uses.get(next_use).copied().unwrap_or(u16::MAX)
 	}
 	fn next_use(&self, op: u16) -> u16 {
 		self.next_use_from(self.op_idx, op)
 	}
-	
+
 	fn allocate_zmm_for(&mut self, whatfor: u16) -> u8 {
 		for zmm in ZMM_FREE..=31 {
 			let user = self.zmm_users[zmm as usize];
@@ -822,6 +827,7 @@ impl Compiler {
 		let zmm = (ZMM_FREE..=31)
 			.max_by_key(|&x| self.next_use(self.zmm_users[x as usize].unwrap()))
 			.unwrap();
+
 		// evict previous user
 		let prev_user = self.zmm_users[zmm as usize].unwrap();
 		let buffer_idx = if let Some(prev_buffer_user) = self.buffer_users.peek()
@@ -850,16 +856,6 @@ impl Compiler {
 	fn allocate_zmm(&mut self) -> u8 {
 		self.allocate_zmm_for(self.op_idx)
 	}
-	fn load_var_to_zmm(&mut self, var: u16) -> u8 {
-		let location = self.locations[var as usize];
-		if let Location::Zmm(z) = location {
-			return z;
-		}
-		let dest = self.allocate_zmm_for(var);
-		self.instructions.push(Instruction::Mov(dest, location));
-		self.locations[var as usize] = Location::Zmm(dest);
-		dest
-	}
 	#[must_use]
 	fn compile_binop_with_constant(
 		&mut self,
@@ -876,13 +872,20 @@ impl Compiler {
 	#[must_use]
 	fn compile_binop(
 		&mut self,
+		is_symmetric: bool,
 		constructor: impl FnOnce(u8, u8, Location) -> Instruction,
-		arg1: Location,
-		arg2: Location,
+		arg1op: u16,
+		arg2op: u16,
 	) -> Location {
+		let arg1 = self.locations[arg1op as usize];
+		let arg2 = self.locations[arg2op as usize];
 		let dest = self.allocate_zmm();
-		let zmm1 = arg1.load_zmm(&mut self.instructions);
-		self.instructions.push(constructor(dest, zmm1, arg2));
+		if is_symmetric && let Location::Zmm(arg2) = arg2 {
+			self.instructions.push(constructor(dest, arg2, arg1));
+		} else {
+			let zmm1 = arg1.load_zmm(&mut self.instructions);
+			self.instructions.push(constructor(dest, zmm1, arg2));
+		}
 		Location::Zmm(dest)
 	}
 	#[must_use]
@@ -933,36 +936,24 @@ impl Compiler {
 					let arg = self.locations[arg as usize];
 					let dest = self.allocate_zmm();
 					self.instructions
-						.push(Instruction::LoadConstant(ZMM_SCRATCH, constant));
+						.push(Instruction::Mov(ZMM_SCRATCH, Location::Constant(constant)));
 					self.instructions
 						.push(Instruction::Sub(dest, ZMM_SCRATCH, arg));
 					Location::Zmm(dest)
 				}
 			}
 			Op::Add(arg1, ValueId::Var(arg2)) => {
-				let arg1 = self.locations[arg1 as usize];
-				let arg2 = self.locations[arg2 as usize];
-				self.compile_binop(Instruction::Add, arg1, arg2)
+				self.compile_binop(true, Instruction::Add, arg1, arg2)
 			}
-			Op::Sub(arg1, arg2) => {
-				let arg1 = self.locations[arg1 as usize];
-				let arg2 = self.locations[arg2 as usize];
-				self.compile_binop(Instruction::Sub, arg1, arg2)
-			}
+			Op::Sub(arg1, arg2) => self.compile_binop(false, Instruction::Sub, arg1, arg2),
 			Op::Min(arg1, ValueId::Var(arg2)) => {
-				let arg1 = self.locations[arg1 as usize];
-				let arg2 = self.locations[arg2 as usize];
-				self.compile_binop(Instruction::Min, arg1, arg2)
+				self.compile_binop(true, Instruction::Min, arg1, arg2)
 			}
 			Op::Max(arg1, ValueId::Var(arg2)) => {
-				let arg1 = self.locations[arg1 as usize];
-				let arg2 = self.locations[arg2 as usize];
-				self.compile_binop(Instruction::Max, arg1, arg2)
+				self.compile_binop(true, Instruction::Max, arg1, arg2)
 			}
 			Op::Mul(arg1, ValueId::Var(arg2)) => {
-				let arg1 = self.locations[arg1 as usize];
-				let arg2 = self.locations[arg2 as usize];
-				self.compile_binop(Instruction::Mul, arg1, arg2)
+				self.compile_binop(true, Instruction::Mul, arg1, arg2)
 			}
 			Op::Sqrt(arg) => {
 				let arg = self.locations[arg as usize];
@@ -1022,30 +1013,17 @@ fn compile_down(ops: Vec<Op>) -> CompilationResult {
 		constants,
 		..
 	} = compiler;
-	match *locations.last().unwrap() {
-		Location::Buffer(b) => {
-			instructions.push(Instruction::LoadBuffer(ZMM_OUTPUT, b));
-		}
-		Location::Constant(c) => {
-			instructions.push(Instruction::LoadConstant(ZMM_OUTPUT, c));
-		}
-		Location::Zmm(z) => {
-			if let Some(output) = instructions
-				.last_mut()
-				.and_then(|i| i.output_register())
-				.filter(|x| **x == z)
-			{
-				// fix up output register of last instruction
-				*output = ZMM_OUTPUT;
-			} else {
-				// otherwise,
-				// (weird case, only happens with extraneous instructions
-				//  or result = var-x or something)
-				// do this suboptimal register transfer
-				instructions.push(Instruction::StoreBuffer(0, z));
-				instructions.push(Instruction::LoadBuffer(ZMM_OUTPUT, 0));
-			}
-		}
+	let output_location = *locations.last().unwrap();
+	if let Location::Zmm(z) = output_location
+		&& let Some(output) = instructions
+			.last_mut()
+			.and_then(|i| i.output_register())
+			.filter(|x| **x == z)
+	{
+		// fix up output register of last instruction
+		*output = ZMM_OUTPUT;
+	} else {
+		instructions.push(Instruction::Mov(ZMM_OUTPUT, output_location));
 	}
 	CompilationResult {
 		constants: constants.array,
