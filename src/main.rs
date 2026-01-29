@@ -143,7 +143,7 @@ impl Code {
 
 /// get size of a cache line on this system
 fn get_cache_line_size() -> usize {
-	let mut cpuinfo: u64 = 0;
+	let mut cpuinfo: u64;
 	unsafe {
 		std::arch::asm!(
 			"push rbx\n
