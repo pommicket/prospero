@@ -1161,6 +1161,11 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 	for (i, x_stride) in x_strides.iter_mut().enumerate() {
 		*x_stride = -1.0 + i as f32 * 2.0 / f32::from(width);
 	}
+	// this is needed because BMP bizarrely treats
+	// the most significant bit as the first bit
+	x_strides[..8].reverse();
+	x_strides[8..].reverse();
+
 	let x_strides = ZmmValue(x_strides);
 	let info = Info {
 		code,
